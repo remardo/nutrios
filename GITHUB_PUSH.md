@@ -4,7 +4,7 @@
 
 1. **Add remote origin:**
    ```bash
-   git remote add origin https://github.com/YOUR_USERNAME/nutrios.git
+   git remote add origin https://github.com/remardo/nutrios.git
    ```
 
 2. **Push to GitHub:**

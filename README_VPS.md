@@ -7,7 +7,7 @@ For a complete setup with systemd services and Nginx:
 
 ```bash
 # Download and run deployment script
-wget https://raw.githubusercontent.com/your-repo/main/deploy_vps.sh
+wget https://raw.githubusercontent.com/remardo/nutrios/master/deploy_vps.sh
 chmod +x deploy_vps.sh
 ./deploy_vps.sh
 ```
@@ -17,7 +17,7 @@ For testing or simple deployment:
 
 ```bash
 # Download and run quick setup
-wget https://raw.githubusercontent.com/your-repo/main/quick_deploy.sh
+wget https://raw.githubusercontent.com/remardo/nutrios/master/quick_deploy.sh
 chmod +x quick_deploy.sh
 ./quick_deploy.sh
 ```

@@ -64,7 +64,7 @@ if [ -d "$PROJECT_DIR" ]; then
 fi
 
 # Clone repository (you'll need to replace with actual repo URL)
-REPO_URL="https://github.com/your-username/nutrios.git"  # Replace with actual repo
+REPO_URL="https://github.com/remardo/nutrios.git"  # Replace with actual repo
 print_status "Cloning repository..."
 git clone "$REPO_URL" "$PROJECT_DIR"
 

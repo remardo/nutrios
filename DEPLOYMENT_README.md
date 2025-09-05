@@ -11,14 +11,14 @@
 
 ### Option 1: Automated (Recommended)
 ```bash
-wget https://raw.githubusercontent.com/your-repo/main/deploy_vps.sh
+wget https://raw.githubusercontent.com/remardo/nutrios/master/deploy_vps.sh
 chmod +x deploy_vps.sh
 ./deploy_vps.sh
 ```
 
 ### Option 2: Quick Manual
 ```bash
-wget https://raw.githubusercontent.com/your-repo/main/quick_deploy.sh
+wget https://raw.githubusercontent.com/remardo/nutrios/master/quick_deploy.sh
 chmod +x quick_deploy.sh
 ./quick_deploy.sh
 ```
