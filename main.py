@@ -359,7 +359,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ------------- MAIN -------------
 def main():
     init_db()
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).request_kwargs({
+        'read_timeout': 30,
+        'connect_timeout': 10,
+        'write_timeout': 30
+    }).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("finalize", finalize_command))
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_correction))
