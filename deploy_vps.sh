@@ -28,8 +28,12 @@ print_error() {
 
 # Check if running as root
 if [[ $EUID -eq 0 ]]; then
-   print_error "This script should not be run as root. Please run as a regular user with sudo access."
-   exit 1
+   print_warning "Running as root. This is not recommended for security reasons."
+   print_warning "Consider creating a non-root user with sudo access."
+   print_status "Continuing deployment as root..."
+   sleep 2
+else
+   print_status "Running as regular user - good!"
 fi
 
 # Update system
@@ -120,6 +124,9 @@ print('Database initialized successfully')
 # Create systemd services
 print_status "Creating systemd services..."
 
+# Get current user (works for both root and regular users)
+CURRENT_USER=$(whoami)
+
 # API Service
 sudo tee /etc/systemd/system/nutrios-api.service > /dev/null << EOF
 [Unit]
@@ -127,7 +134,7 @@ Description=Nutrios API Server
 After=network.target
 
 [Service]
-User=$USER
+User=$CURRENT_USER
 WorkingDirectory=$PROJECT_DIR
 Environment=PATH=$PROJECT_DIR/.venv/bin
 ExecStart=$PROJECT_DIR/.venv/bin/python run_api.py
@@ -145,7 +152,7 @@ Description=Nutrios Telegram Bot
 After=network.target nutrios-api.service
 
 [Service]
-User=$USER
+User=$CURRENT_USER
 WorkingDirectory=$PROJECT_DIR
 Environment=PATH=$PROJECT_DIR/.venv/bin
 ExecStart=$PROJECT_DIR/.venv/bin/python main.py
@@ -163,7 +170,7 @@ Description=Nutrios Streamlit Dashboard
 After=network.target nutrios-api.service
 
 [Service]
-User=$USER
+User=$CURRENT_USER
 WorkingDirectory=$PROJECT_DIR
 Environment=PATH=$PROJECT_DIR/.venv/bin
 ExecStart=$PROJECT_DIR/.venv/bin/streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
