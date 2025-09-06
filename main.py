@@ -147,7 +147,7 @@ async def llm_render_from_image(image_data_url: str, hint_text: str = "") -> str
     resp = client.chat.completions.create(
         model=MODEL_VISION,
         messages=[{"role":"user","content": user_parts}],
-        temperature=0.2
+        temperature=1
     )
     return resp.choices[0].message.content.strip()
 
@@ -156,11 +156,11 @@ async def llm_render_from_text(text: str) -> str:
     resp = client.chat_completions.create(  # fallback for SDK variations
         model=MODEL_TEXT,
         messages=[{"role":"user","content": prompt}],
-        temperature=0.2
+        temperature=1
     ) if hasattr(client, "chat_completions") else client.chat.completions.create(
         model=MODEL_TEXT,
         messages=[{"role":"user","content": prompt}],
-        temperature=0.2
+        temperature=1
     )
     # normalize SDK difference
     content = (resp.choices[0].message.content if hasattr(resp.choices[0], "message") else resp.choices[0].content).strip()
@@ -174,7 +174,7 @@ async def llm_revise(previous_block: str, correction_text: str) -> str:
             {"role":"user","content": "Твой прошлый ответ:\n" + previous_block},
             {"role":"user","content": "Коррекция пользователя:\n" + correction_text}
         ],
-        temperature=0.2
+        temperature=1
     )
     return resp.choices[0].message.content.strip()
 
