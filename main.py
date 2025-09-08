@@ -14,15 +14,16 @@
 #   ADMIN_API_KEY=supersecret
 
 import os, json, base64, sqlite3, logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+    ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 )
+import httpx
 
 # --- Local modules for Admin integration ---
 from bot.parse_block import parse_formatted_block          # bot/parse_block.py
@@ -352,6 +353,116 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def finalize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Ок — просто ответьте реплаем, если нужно исправить детали. Команда финализации не требуется 😊")
 
+# ------------- MENU / STATS -------------
+MENU_CB_HELP = "MENU_HELP"
+MENU_CB_ABOUT = "MENU_ABOUT"
+MENU_CB_DAILY = "MENU_DAILY"
+MENU_CB_WEEKLY = "MENU_WEEKLY"
+
+def menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📖 Инструкция", callback_data=MENU_CB_HELP), InlineKeyboardButton("ℹ️ О боте", callback_data=MENU_CB_ABOUT)],
+        [InlineKeyboardButton("📊 За сегодня", callback_data=MENU_CB_DAILY), InlineKeyboardButton("📆 За неделю", callback_data=MENU_CB_WEEKLY)]
+    ])
+
+INSTRUCTION_TEXT = (
+    "📖 Инструкция\n"
+    "1. Пришлите фото блюда — бот вернёт разбор с калориями и БЖУ.\n"
+    "2. Можно описать блюдо текстом.\n"
+    "3. Уточнения: сообщение со словами ‘добавь’, ‘убери’, ‘без’, ‘ещё/еще’, ‘поменяй’, ‘замени’, или ответ реплаем.\n"
+    "4. /menu — показать меню.\n"
+    "5. Сводки: кнопки ‘За сегодня’ и ‘За неделю’."
+)
+
+ABOUT_TEXT = (
+    "ℹ️ О боте\n"
+    "Nutrios — бот для приблизительной оценки блюд (калории, БЖУ, микроэлементы) по фото или описанию."
+)
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Меню:", reply_markup=menu_keyboard())
+
+async def _fetch_client_id(telegram_user_id: int) -> int | None:
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client_http:
+            r = await client_http.get(f"{os.getenv('ADMIN_API_BASE', 'http://localhost:8000')}/clients")
+            if r.status_code != 200:
+                return None
+            for row in r.json():
+                if row.get("telegram_user_id") == telegram_user_id:
+                    return row.get("id")
+    except Exception:
+        return None
+    return None
+
+async def _fetch_summary(client_id: int, kind: str):
+    base = os.getenv('ADMIN_API_BASE', 'http://localhost:8000')
+    url = f"{base}/clients/{client_id}/summary/{'daily' if kind=='daily' else 'weekly'}"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client_http:
+            r = await client_http.get(url)
+            if r.status_code != 200:
+                return []
+            return r.json() or []
+    except Exception:
+        return []
+
+def _fmt_macros(kcal, p, f, c):
+    def _n(v):
+        try:
+            if v is None: return 0
+            return int(round(float(v)))
+        except Exception:
+            return 0
+    return f"Калории: {_n(kcal)} ккал\nБелки: {_n(p)} г · Жиры: {_n(f)} г · Углеводы: {_n(c)} г"
+
+async def _build_daily_text(telegram_user_id: int) -> str:
+    client_id = await _fetch_client_id(telegram_user_id)
+    if not client_id:
+        return "Нет данных за сегодня (ещё не распознано ни одного блюда)."
+    data = await _fetch_summary(client_id, 'daily')
+    if not data:
+        return "Нет данных за сегодня."
+    today_iso = date.today().isoformat()
+    row_today = None
+    for r in data:
+        if r.get("period_start", "").startswith(today_iso):
+            row_today = r; break
+    if not row_today:
+        row_today = data[-1]
+    return "📊 Сводка за сегодня (" + row_today.get("period_start", '')[:10] + ")\n" + _fmt_macros(row_today.get("kcal"), row_today.get("protein_g"), row_today.get("fat_g"), row_today.get("carbs_g"))
+
+async def _build_weekly_text(telegram_user_id: int) -> str:
+    client_id = await _fetch_client_id(telegram_user_id)
+    if not client_id:
+        return "Нет данных за неделю (ещё не распознано ни одного блюда)."
+    data = await _fetch_summary(client_id, 'weekly')
+    if not data:
+        return "Нет данных за неделю."
+    row = data[-1]
+    return "📆 Сводка за неделю (начало " + row.get("period_start", '')[:10] + ")\n" + _fmt_macros(row.get("kcal"), row.get("protein_g"), row.get("fat_g"), row.get("carbs_g"))
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = query.data
+    if data == MENU_CB_HELP:
+        text = INSTRUCTION_TEXT
+    elif data == MENU_CB_ABOUT:
+        text = ABOUT_TEXT
+    elif data == MENU_CB_DAILY:
+        text = await _build_daily_text(query.from_user.id)
+    elif data == MENU_CB_WEEKLY:
+        text = await _build_weekly_text(query.from_user.id)
+    else:
+        text = "Неизвестный пункт меню."
+    try:
+        await query.edit_message_text(text, reply_markup=menu_keyboard())
+    except Exception:
+        await query.message.reply_text(text, reply_markup=menu_keyboard())
+
 # ------------- ERROR HANDLER -------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.exception("Unhandled exception", exc_info=context.error)
@@ -362,6 +473,8 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("finalize", finalize_command))
+    app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_correction))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
