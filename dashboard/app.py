@@ -123,9 +123,9 @@ with left:
     if not imgs:
         st.info("Нет фото в выбранном периоде или фото отсутствуют у блюд.")
     else:
-        # page size & nav
-        top_l, top_m, top_r = st.columns([2, 3, 2])
-        with top_l:
+        # page size & nav (single level columns; no nested columns)
+        c_size, c_label, c_first, c_prev, c_next, c_last = st.columns([2, 6, 1, 1, 1, 1])
+        with c_size:
             page_size = st.selectbox(
                 "На странице",
                 options=[6, 9, 12, 15, 18],
@@ -134,27 +134,25 @@ with left:
                 else 1,
                 key="gallery_page_size",
             )
-        with top_m:
-            total_pages = max(1, (len(imgs) + page_size - 1) // page_size)
-            # clamp page to available range
-            st.session_state.gallery_page = max(1, min(st.session_state.gallery_page, total_pages))
+        total_pages = max(1, (len(imgs) + page_size - 1) // page_size)
+        # clamp page to available range
+        st.session_state.gallery_page = max(1, min(st.session_state.gallery_page, total_pages))
+        with c_label:
             st.markdown(
                 f"Страница **{st.session_state.gallery_page}** из **{total_pages}**  ·  всего фото: {len(imgs)}"
             )
-        with top_r:
-            b1, b2, b3, b4 = st.columns(4)
-            with b1:
-                if st.button("⏮", help="В начало", key="gal_first"):
-                    st.session_state.gallery_page = 1
-            with b2:
-                if st.button("◀", help="Назад", key="gal_prev"):
-                    st.session_state.gallery_page = max(1, st.session_state.gallery_page - 1)
-            with b3:
-                if st.button("▶", help="Вперёд", key="gal_next"):
-                    st.session_state.gallery_page = min(total_pages, st.session_state.gallery_page + 1)
-            with b4:
-                if st.button("⏭", help="В конец", key="gal_last"):
-                    st.session_state.gallery_page = total_pages
+        with c_first:
+            if st.button("⏮", help="В начало", key="gal_first"):
+                st.session_state.gallery_page = 1
+        with c_prev:
+            if st.button("◀", help="Назад", key="gal_prev"):
+                st.session_state.gallery_page = max(1, st.session_state.gallery_page - 1)
+        with c_next:
+            if st.button("▶", help="Вперёд", key="gal_next"):
+                st.session_state.gallery_page = min(total_pages, st.session_state.gallery_page + 1)
+        with c_last:
+            if st.button("⏭", help="В конец", key="gal_last"):
+                st.session_state.gallery_page = total_pages
 
         # slice for current page
         page = st.session_state.gallery_page
