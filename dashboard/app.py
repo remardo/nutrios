@@ -94,11 +94,23 @@ for k, v in active_flags.items():
 
 df_f = df.loc[mask].sort_values("captured_at", ascending=False).reset_index(drop=True)
 
+# reset gallery page on filter change
+filter_key = f"{date_from}_{date_to}_{q}_{f1}{f2}{f3}{f4}"
+if "gallery_filter_key" not in st.session_state:
+    st.session_state.gallery_filter_key = filter_key
+if st.session_state.gallery_filter_key != filter_key:
+    st.session_state.gallery_filter_key = filter_key
+    st.session_state.gallery_page = 1
+
 # --- main layout: gallery + table/details ---
 left, right = st.columns([2, 3], gap="large")
 
 if "selected_meal_id" not in st.session_state:
     st.session_state.selected_meal_id = None
+if "gallery_page" not in st.session_state:
+    st.session_state.gallery_page = 1
+if "gallery_page_size" not in st.session_state:
+    st.session_state.gallery_page_size = 9  # by default 3x3
 
 with left:
     st.subheader("Галерея за период")
@@ -111,9 +123,48 @@ with left:
     if not imgs:
         st.info("Нет фото в выбранном периоде или фото отсутствуют у блюд.")
     else:
+        # page size & nav
+        top_l, top_m, top_r = st.columns([2, 3, 2])
+        with top_l:
+            page_size = st.selectbox(
+                "На странице",
+                options=[6, 9, 12, 15, 18],
+                index=[6, 9, 12, 15, 18].index(st.session_state.gallery_page_size)
+                if st.session_state.gallery_page_size in [6, 9, 12, 15, 18]
+                else 1,
+                key="gallery_page_size",
+            )
+        with top_m:
+            total_pages = max(1, (len(imgs) + page_size - 1) // page_size)
+            # clamp page to available range
+            st.session_state.gallery_page = max(1, min(st.session_state.gallery_page, total_pages))
+            st.markdown(
+                f"Страница **{st.session_state.gallery_page}** из **{total_pages}**  ·  всего фото: {len(imgs)}"
+            )
+        with top_r:
+            b1, b2, b3, b4 = st.columns(4)
+            with b1:
+                if st.button("⏮", help="В начало", key="gal_first"):
+                    st.session_state.gallery_page = 1
+            with b2:
+                if st.button("◀", help="Назад", key="gal_prev"):
+                    st.session_state.gallery_page = max(1, st.session_state.gallery_page - 1)
+            with b3:
+                if st.button("▶", help="Вперёд", key="gal_next"):
+                    st.session_state.gallery_page = min(total_pages, st.session_state.gallery_page + 1)
+            with b4:
+                if st.button("⏭", help="В конец", key="gal_last"):
+                    st.session_state.gallery_page = total_pages
+
+        # slice for current page
+        page = st.session_state.gallery_page
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_imgs = imgs[start:end]
+
         # grid 3xN
         ncols = 3
-        rows = [imgs[i:i + ncols] for i in range(0, len(imgs), ncols)]
+        rows = [page_imgs[i:i + ncols] for i in range(0, len(page_imgs), ncols)]
         for row in rows:
             cols = st.columns(ncols)
             for (r, p), col in zip(row, cols):
