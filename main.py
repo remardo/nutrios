@@ -380,7 +380,12 @@ ABOUT_TEXT = (
 )
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("/menu invoked chat_id=%s", update.effective_chat.id if update.effective_chat else None)
     await update.message.reply_text("Меню:", reply_markup=menu_keyboard())
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Alias to /menu for convenience
+    await menu_command(update, context)
 
 async def _fetch_client_id(telegram_user_id: int) -> int | None:
     try:
@@ -473,6 +478,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("finalize", finalize_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_correction))
