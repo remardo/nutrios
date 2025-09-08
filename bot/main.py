@@ -399,6 +399,21 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await menu_command(update, context)
 
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _build_daily_text(update.effective_user.id)
+    await update.message.reply_text(text)
+
+async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _build_weekly_text(update.effective_user.id)
+    await update.message.reply_text(text)
+
+async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        d = update.to_dict(); keys = list(d.keys())
+        log.info("DEBUG update keys=%s has_callback=%s has_message=%s", keys, 'callback_query' in d, 'message' in d)
+    except Exception:
+        pass
+
 async def _fetch_client_id(telegram_user_id: int) -> int | None:
     try:
         async with httpx.AsyncClient(timeout=8.0) as client_http:
@@ -507,6 +522,9 @@ def main():
     app.add_handler(CommandHandler("finalize", finalize_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CommandHandler("today", today_command))
+    app.add_handler(CommandHandler("week", week_command))
+    app.add_handler(MessageHandler(filters.ALL, debug_all))
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_correction))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
