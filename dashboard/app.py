@@ -30,6 +30,25 @@ with right:
     df = pd.DataFrame(meals)
     df["captured_at"] = pd.to_datetime(df["captured_at"])
     df_show = df[["captured_at","title","portion_g","kcal","protein_g","fat_g","carbs_g","flags","micronutrients","source_type","image_path"]]
+
+    # Галерея фото
+    st.subheader("Загруженные фото")
+    img_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "downloads"))
+    images = []
+    for img_path in df["image_path"].dropna():
+        # Если путь относительный, ищем файл в downloads
+        if not os.path.isabs(img_path):
+            full_path = os.path.join(img_dir, img_path)
+        else:
+            full_path = img_path
+        if os.path.exists(full_path):
+            images.append(full_path)
+    if images:
+        for img in images:
+            st.image(img, width=200)
+    else:
+        st.info("Нет загруженных фото для выбранного клиента.")
+
     st.dataframe(df_show, use_container_width=True, height=320)
 
     st.markdown("---")
