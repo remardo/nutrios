@@ -451,22 +451,34 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
-    await query.answer()
-    data = query.data
-    if data == MENU_CB_HELP:
-        text = INSTRUCTION_TEXT
-    elif data == MENU_CB_ABOUT:
-        text = ABOUT_TEXT
-    elif data == MENU_CB_DAILY:
-        text = await _build_daily_text(query.from_user.id)
-    elif data == MENU_CB_WEEKLY:
-        text = await _build_weekly_text(query.from_user.id)
-    else:
-        text = "Неизвестный пункт меню."
+    data = query.data or ""
+    log.info("callback received data=%s chat_id=%s", data, query.message.chat_id if query.message else None)
+    try:
+        await query.answer("Обновляю…", show_alert=False)
+    except Exception:
+        pass
+    try:
+        if data == MENU_CB_HELP:
+            text = INSTRUCTION_TEXT
+        elif data == MENU_CB_ABOUT:
+            text = ABOUT_TEXT
+        elif data == MENU_CB_DAILY:
+            text = await _build_daily_text(query.from_user.id)
+        elif data == MENU_CB_WEEKLY:
+            text = await _build_weekly_text(query.from_user.id)
+        else:
+            text = "Неизвестный пункт меню."
+    except Exception as e:
+        log.exception("error building callback response", exc_info=e)
+        text = "Ошибка при получении данных. Попробуйте позже."
     try:
         await query.edit_message_text(text, reply_markup=menu_keyboard())
-    except Exception:
-        await query.message.reply_text(text, reply_markup=menu_keyboard())
+    except Exception as e:
+        log.warning("edit_message_text failed: %s", e)
+        try:
+            await query.message.reply_text(text, reply_markup=menu_keyboard())
+        except Exception:
+            pass
 
 # ------------- ERROR HANDLER -------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
