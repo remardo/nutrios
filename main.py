@@ -14,7 +14,7 @@
 #   ADMIN_API_KEY=supersecret
 
 import os, json, base64, sqlite3, logging
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -443,9 +443,16 @@ def _fmt_macros(kcal, p, f, c):
 async def _build_daily_text(telegram_user_id: int) -> str:
     client_id = await _fetch_client_id(telegram_user_id)
     if not client_id:
+        # Fallback to local interactions DB aggregation
+        txt = _daily_local_summary_text(telegram_user_id)
+        if txt:
+            return txt
         return "Нет данных за сегодня (ещё не распознано ни одного блюда)."
     data = await _fetch_summary(client_id, 'daily')
     if not data:
+        txt = _daily_local_summary_text(telegram_user_id)
+        if txt:
+            return txt
         return "Нет данных за сегодня."
     today_iso = date.today().isoformat()
     row_today = None
@@ -459,10 +466,65 @@ async def _build_daily_text(telegram_user_id: int) -> str:
 async def _build_weekly_text(telegram_user_id: int) -> str:
     client_id = await _fetch_client_id(telegram_user_id)
     if not client_id:
+        txt = _weekly_local_summary_text(telegram_user_id)
+        if txt:
+            return txt
         return "Нет данных за неделю (ещё не распознано ни одного блюда)."
     data = await _fetch_summary(client_id, 'weekly')
     if not data:
+        txt = _weekly_local_summary_text(telegram_user_id)
+        if txt:
+            return txt
         return "Нет данных за неделю."
+
+def _sum_local_for_period(telegram_user_id: int, start_utc: datetime, end_utc: datetime):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT bot_output FROM interactions
+            WHERE chat_id=? AND created_at>=? AND created_at<?
+            """,
+            (telegram_user_id, start_utc.isoformat(), end_utc.isoformat()),
+        )
+        rows = c.fetchall()
+        conn.close()
+        kcal = p = f = carb = 0.0
+        for (text,) in rows:
+            try:
+                parsed = parse_formatted_block(text)
+                kcal += float(parsed.get("kcal") or 0)
+                p += float(parsed.get("protein_g") or 0)
+                f += float(parsed.get("fat_g") or 0)
+                carb += float(parsed.get("carbs_g") or 0)
+            except Exception:
+                continue
+        return kcal, p, f, carb
+    except Exception:
+        return None
+
+def _daily_local_summary_text(telegram_user_id: int) -> str | None:
+    now = datetime.now(timezone.utc)
+    start = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+    sums = _sum_local_for_period(telegram_user_id, start, start + timedelta(days=1))
+    if not sums:
+        return None
+    kcal, p, f, carb = sums
+    if kcal <= 0 and p <= 0 and f <= 0 and carb <= 0:
+        return None
+    return "📊 Сводка за сегодня (" + start.date().isoformat() + ")\n" + _fmt_macros(kcal, p, f, carb)
+
+def _weekly_local_summary_text(telegram_user_id: int) -> str | None:
+    now = datetime.now(timezone.utc)
+    start = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc) - timedelta(days=6)
+    sums = _sum_local_for_period(telegram_user_id, start, start + timedelta(days=7))
+    if not sums:
+        return None
+    kcal, p, f, carb = sums
+    if kcal <= 0 and p <= 0 and f <= 0 and carb <= 0:
+        return None
+    return "📆 Сводка за неделю (начало " + start.date().isoformat() + ")\n" + _fmt_macros(kcal, p, f, carb)
     row = data[-1]
     return "📆 Сводка за неделю (начало " + row.get("period_start", '')[:10] + ")\n" + _fmt_macros(row.get("kcal"), row.get("protein_g"), row.get("fat_g"), row.get("carbs_g"))
 
