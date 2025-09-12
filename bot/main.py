@@ -225,6 +225,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("handle_photo: received update has_photo=%s", bool(update.message and update.message.photo))
     if not update.message or not update.message.photo:
         return
     photo = update.message.photo[-1]
@@ -262,6 +263,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_interaction(update.effective_chat.id, update.message.message_id, sent.message_id, "image", caption, block)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.info("handle_text: has_text=%s is_reply=%s", bool(update.message and update.message.text), bool(update.message and update.message.reply_to_message))
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
@@ -531,7 +533,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
     log.info("Bot started.")
-    app.run_polling(close_loop=False)
+    from telegram import Update as TgUpdate
+    app.run_polling(allowed_updates=TgUpdate.ALL_TYPES, close_loop=False, drop_pending_updates=False)
 
 if __name__ == "__main__":
     main()
