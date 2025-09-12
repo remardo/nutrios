@@ -514,7 +514,7 @@ def main():
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("week", week_command))
     # Debug handler (last) to log raw updates if callbacks still not coming
-    app.add_handler(MessageHandler(filters.ALL, debug_all))
+    app.add_handler(MessageHandler(filters.ALL, debug_all, block=False), group=100)
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_correction))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
