@@ -77,6 +77,29 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Подсказка: в галерее нажмите ‘Выбрать’ чтобы подсветить блюдо в таблице.")
 
+    # Доп. фильтры для типов жиров (управляют отображением на графиках)
+    st.subheader("Жиры — отображение")
+    fat_options_map = {
+        "Всего": "fats_total",
+        "Насыщенные": "fats_saturated",
+        "Моно": "fats_mono",
+        "Поли": "fats_poly",
+        "Транс": "fats_trans",
+        "Омега‑6": "omega6",
+        "Омега‑3": "omega3",
+    }
+    selected_fats = st.multiselect(
+        "Линии на графиках",
+        options=list(fat_options_map.keys()),
+        default=["Всего","Насыщенные","Моно","Поли"],
+    )
+    # Нормативы (виджеты для справки / подсветки)
+    st.subheader("Нормы (ориентиры)")
+    OMEGA_RATIO_MIN, OMEGA_RATIO_MAX = 1.0, 4.0
+    FIBER_MIN, FIBER_MAX = 25.0, 35.0  # г/сутки
+    st.caption(f"ω‑ratio целевой диапазон: {OMEGA_RATIO_MIN}–{OMEGA_RATIO_MAX}")
+    st.caption(f"Клетчатка в сутки: {FIBER_MIN}–{FIBER_MAX} г")
+
 # --- apply filters ---
 mask = (df["captured_at"].dt.date >= date_from) & (df["captured_at"].dt.date <= date_to)
 if q:
@@ -245,6 +268,50 @@ with right:
 
 st.markdown("---")
 
+# Сводные карточки по нормам (за текущий выбранный день)
+# Вычислим по данным extras/daily, отфильтрованным по периоду селектора
+try:
+    ex_daily = requests.get(f"{API}/clients/{client_id}/extras/daily", headers=HDR).json()
+    edf = pd.DataFrame(ex_daily)
+except Exception:
+    edf = pd.DataFrame()
+if not edf.empty:
+    edf["period_start"] = pd.to_datetime(edf["period_start"]).dt.tz_localize(None)
+    # Применим фильтр дат, взятый из истории блюд (df_f)
+    dmin_sel = pd.to_datetime(date_from)
+    dmax_sel = pd.to_datetime(date_to) + pd.Timedelta(days=1)  # inclusive day end
+    edf_f = edf[(edf["period_start"].dt.date >= date_from) & (edf["period_start"].dt.date <= date_to)].copy()
+    # Возьмем последний день периода (или ближайший) для карточек
+    if not edf_f.empty:
+        last_row = edf_f.sort_values("period_start").iloc[-1]
+        omega_ratio = last_row.get("omega_ratio_num")
+        if (omega_ratio is None or (isinstance(omega_ratio, float) and pd.isna(omega_ratio))) and {"omega6","omega3"}.issubset(edf_f.columns):
+            try:
+                omega_ratio = float(last_row["omega6"]) / float(last_row["omega3"]) if last_row["omega3"] else None
+            except Exception:
+                omega_ratio = None
+        fiber_total = last_row.get("fiber_total")
+
+        cA, cB = st.columns(2)
+        with cA:
+            st.metric("ω‑ratio (последний день)", f"{omega_ratio:.2f}" if omega_ratio is not None else "—")
+            if omega_ratio is not None:
+                if OMEGA_RATIO_MIN <= omega_ratio <= OMEGA_RATIO_MAX:
+                    st.caption("В норме")
+                elif omega_ratio < OMEGA_RATIO_MIN:
+                    st.caption("Ниже целевого диапазона")
+                else:
+                    st.caption("Выше целевого диапазона")
+        with cB:
+            st.metric("Клетчатка, г/сутки (последний день)", f"{fiber_total:.0f}" if fiber_total is not None else "—")
+            if fiber_total is not None:
+                if FIBER_MIN <= fiber_total <= FIBER_MAX:
+                    st.caption("В норме")
+                elif fiber_total < FIBER_MIN:
+                    st.caption("Ниже нормы")
+                else:
+                    st.caption("Выше нормы")
+
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("Сумма БЖУ — по дням")
@@ -277,33 +344,47 @@ if micro:
 st.markdown("---")
 
 st.subheader("Жиры подробно и клетчатка — по дням")
-ex_daily = requests.get(f"{API}/clients/{client_id}/extras/daily", headers=HDR).json()
-edf = pd.DataFrame(ex_daily)
 if not edf.empty:
-    edf["period_start"] = pd.to_datetime(edf["period_start"])
-    cols_fats = [c for c in ["fats_total","fats_saturated","fats_mono","fats_poly","fats_trans"] if c in edf.columns]
-    cols_fiber = [c for c in ["fiber_total","fiber_soluble","fiber_insoluble"] if c in edf.columns]
-    if cols_fats:
-        st.line_chart(edf.set_index("period_start")[cols_fats])
-    if cols_fiber:
-        st.line_chart(edf.set_index("period_start")[cols_fiber])
-    if "omega6" in edf.columns and "omega3" in edf.columns:
-        st.line_chart(edf.set_index("period_start")[["omega6","omega3"]])
-    if "omega_ratio_num" in edf.columns:
-        st.line_chart(edf.set_index("period_start")[["omega_ratio_num"]])
+    # фильтр по выбранному периоду
+    edf2 = edf[(edf["period_start"].dt.date >= date_from) & (edf["period_start"].dt.date <= date_to)].copy()
+    if not edf2.empty:
+        edf2["period_start"] = pd.to_datetime(edf2["period_start"]).dt.tz_localize(None)
+        all_fats_cols = ["fats_total","fats_saturated","fats_mono","fats_poly","fats_trans"]
+        # применяем выбор пользователя
+        selected_cols = [fat_options_map[name] for name in selected_fats if fat_options_map[name] in edf2.columns]
+        cols_fats = [c for c in all_fats_cols if c in selected_cols]
+        cols_fiber = [c for c in ["fiber_total","fiber_soluble","fiber_insoluble"] if c in edf2.columns]
+        if cols_fats:
+            st.line_chart(edf2.set_index("period_start")[cols_fats])
+        if cols_fiber:
+            st.line_chart(edf2.set_index("period_start")[cols_fiber])
+        om_cols = [c for c in ["omega6","omega3"] if c in edf2.columns and ("Омега‑6" in selected_fats or "Омега‑3" in selected_fats)]
+        if om_cols:
+            st.line_chart(edf2.set_index("period_start")[om_cols])
+        if "omega_ratio_num" in edf2.columns:
+            st.line_chart(edf2.set_index("period_start")[["omega_ratio_num"]])
 
 st.subheader("Жиры подробно и клетчатка — по неделям")
-ex_weekly = requests.get(f"{API}/clients/{client_id}/extras/weekly", headers=HDR).json()
-ewf = pd.DataFrame(ex_weekly)
+try:
+    ex_weekly = requests.get(f"{API}/clients/{client_id}/extras/weekly", headers=HDR).json()
+    ewf = pd.DataFrame(ex_weekly)
+except Exception:
+    ewf = pd.DataFrame()
 if not ewf.empty:
-    ewf["period_start"] = pd.to_datetime(ewf["period_start"])
-    cols_fats_w = [c for c in ["fats_total","fats_saturated","fats_mono","fats_poly","fats_trans"] if c in ewf.columns]
-    cols_fiber_w = [c for c in ["fiber_total","fiber_soluble","fiber_insoluble"] if c in ewf.columns]
-    if cols_fats_w:
-        st.line_chart(ewf.set_index("period_start")[cols_fats_w])
-    if cols_fiber_w:
-        st.line_chart(ewf.set_index("period_start")[cols_fiber_w])
-    if "omega6" in ewf.columns and "omega3" in ewf.columns:
-        st.line_chart(ewf.set_index("period_start")[["omega6","omega3"]])
-    if "omega_ratio_num" in ewf.columns:
-        st.line_chart(ewf.set_index("period_start")[["omega_ratio_num"]])
+    ewf["period_start"] = pd.to_datetime(ewf["period_start"]).dt.tz_localize(None)
+    # фильтр по периоду (на неделях — включим недели, попадающие в диапазон)
+    ewf2 = ewf[(ewf["period_start"].dt.date >= date_from) & (ewf["period_start"].dt.date <= date_to)].copy()
+    if not ewf2.empty:
+        all_fats_cols_w = ["fats_total","fats_saturated","fats_mono","fats_poly","fats_trans"]
+        selected_cols_w = [fat_options_map[name] for name in selected_fats if fat_options_map[name] in ewf2.columns]
+        cols_fats_w = [c for c in all_fats_cols_w if c in selected_cols_w]
+        cols_fiber_w = [c for c in ["fiber_total","fiber_soluble","fiber_insoluble"] if c in ewf2.columns]
+        if cols_fats_w:
+            st.line_chart(ewf2.set_index("period_start")[cols_fats_w])
+        if cols_fiber_w:
+            st.line_chart(ewf2.set_index("period_start")[cols_fiber_w])
+        om_cols_w = [c for c in ["omega6","omega3"] if c in ewf2.columns and ("Омега‑6" in selected_fats or "Омега‑3" in selected_fats)]
+        if om_cols_w:
+            st.line_chart(ewf2.set_index("period_start")[om_cols_w])
+        if "omega_ratio_num" in ewf2.columns:
+            st.line_chart(ewf2.set_index("period_start")[["omega_ratio_num"]])
