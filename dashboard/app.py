@@ -194,6 +194,35 @@ with right:
                     f"{r['captured_at'].strftime('%Y-%m-%d %H:%M')} • {r['portion_g']} г\n\n"
                     f"Ккал: {r['kcal']} • Б: {r['protein_g']} г • Ж: {r['fat_g']} г • У: {r['carbs_g']} г\n\n"
                 )
+                extras = r.get("extras") or {}
+                if extras:
+                    fats = (extras or {}).get("fats") or {}
+                    fiber = (extras or {}).get("fiber") or {}
+                    lines = []
+                    if fats:
+                        parts = []
+                        if fats.get("total") is not None: parts.append(f"всего {fats['total']} г")
+                        if fats.get("saturated") is not None: parts.append(f"насыщенные {fats['saturated']} г")
+                        if fats.get("mono") is not None: parts.append(f"моно {fats['mono']} г")
+                        if fats.get("poly") is not None: parts.append(f"поли {fats['poly']} г")
+                        if fats.get("trans") is not None: parts.append(f"транс {fats['trans']} г")
+                        if parts:
+                            lines.append("Жиры подробно: " + "; ".join(parts))
+                        if fats.get("omega6") is not None or fats.get("omega3") is not None or fats.get("omega_ratio"):
+                            om = []
+                            if fats.get("omega6") is not None: om.append(f"ω6 {fats['omega6']} г")
+                            if fats.get("omega3") is not None: om.append(f"ω3 {fats['omega3']} г")
+                            if fats.get("omega_ratio"): om.append(f"соотношение {fats['omega_ratio']}")
+                            lines.append("Омега: " + "; ".join(om))
+                    if fiber:
+                        parts = []
+                        if fiber.get("total") is not None: parts.append(f"всего {fiber['total']} г")
+                        if fiber.get("soluble") is not None: parts.append(f"растворимая {fiber['soluble']} г")
+                        if fiber.get("insoluble") is not None: parts.append(f"нерастворимая {fiber['insoluble']} г")
+                        if parts:
+                            lines.append("Клетчатка: " + ", ".join(parts))
+                    if lines:
+                        st.caption("\n".join(lines))
                 st.caption("Флаги: " + _pretty(r.get("flags")))
                 if r.get("micronutrients"):
                     st.caption("Микроэлементы: " + ", ".join(r["micronutrients"]))

@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
-from .db import SessionLocal, init_db
+from .db import SessionLocal, init_db, ensure_meals_extras_column
 from .models import Base, Client, Meal
 from .auth import require_api_key
 from .analysis import df_meals, summary_macros, micro_top
@@ -18,6 +18,7 @@ def get_db():
 
 # init
 init_db(Base)
+ensure_meals_extras_column()
 
 # ----- Schemas -----
 class IngestMeal(BaseModel):
@@ -34,6 +35,7 @@ class IngestMeal(BaseModel):
     flags: dict
     micronutrients: List[str] = []
     assumptions: List[str] = []
+    extras: Optional[dict] = None  # {fats: {total,saturated,mono,poly,trans,omega6,omega3}, fiber: {total,soluble,insoluble}, omega_ratio: "6:3"}
     source_type: str
     image_path: Optional[str] = None
     message_id: int
@@ -75,6 +77,7 @@ def list_meals(client_id: int, db: Session = Depends(get_db)):
         "id": r.id, "captured_at": r.captured_at.isoformat(), "title": r.title, "portion_g": r.portion_g,
         "kcal": r.kcal, "protein_g": r.protein_g, "fat_g": r.fat_g, "carbs_g": r.carbs_g,
         "flags": r.flags, "micronutrients": r.micronutrients, "assumptions": r.assumptions,
+        "extras": r.extras,
         "image_path": r.image_path, "source_type": r.source_type, "message_id": r.message_id
     } for r in rows]
 

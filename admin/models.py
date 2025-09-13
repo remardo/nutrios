@@ -26,6 +26,7 @@ class Meal(Base):
     flags = Column(JSON)             # {vegetarian, vegan, glutenfree, lactosefree}
     micronutrients = Column(JSON)    # ["Витамин C — 30 mg",...]
     assumptions = Column(JSON)
+    extras = Column(JSON)            # расширенные поля: жиры (sat/mono/poly/trans, omega6/omega3), клетчатка (soluble/insoluble)
     source_type = Column(String)     # image|text
     image_path = Column(String, nullable=True)
     captured_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))

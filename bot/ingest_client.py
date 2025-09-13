@@ -9,7 +9,7 @@ def ingest_meal(payload: Dict[str, Any]) -> None:
     payload включает:
       telegram_user_id, telegram_username, captured_at_iso,
       title, portion_g, confidence, kcal, protein_g, fat_g, carbs_g,
-      flags, micronutrients(list[str]), assumptions(list[str]),
+      flags, micronutrients(list[str]), assumptions(list[str]), extras(dict),
       source_type ('image'|'text'), image_path(optional), message_id
     """
     with httpx.Client(timeout=10.0) as client:

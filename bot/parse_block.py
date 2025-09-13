@@ -13,7 +13,8 @@ def parse_formatted_block(block: str) -> Dict[str, Any]:
         "kcal": 360,
         "protein_g": None, "fat_g": None, "carbs_g": None,
         "flags": {"vegetarian": None, "vegan": None, "glutenfree": None, "lactosefree": None},
-        "micronutrients": [], "assumptions": []
+        "micronutrients": [], "assumptions": [],
+        "extras": {"fats": {}, "fiber": {}}
     }
     # title — вторая строка
     m = re.search(r"\n([^\n]+)\.\nПорция", block)
@@ -32,6 +33,53 @@ def parse_formatted_block(block: str) -> Dict[str, Any]:
     m = re.search(r"БЖУ:\s*белки\s*([\d]+)\s*г\s*·\s*жиры\s*([\d]+)\s*г\s*·\s*углеводы\s*([\d]+)\s*г", block)
     if m:
         data["protein_g"] = int(m.group(1)); data["fat_g"] = int(m.group(2)); data["carbs_g"] = int(m.group(3))
+
+    # Расширенный разбор жиров (если присутствует в блоке)
+    # Примеры ожидаемых строк:
+    # Жиры подробно: всего 20 г; насыщенные 6 г; мононенасыщенные 8 г; полиненасыщенные 5 г; транс <0.5 г
+    # Омега: омега-6 4 г; омега-3 1 г (соотношение 4:1)
+    fats = {}
+    m = re.search(r"Жиры подробно:\s*всего\s*([\d.,]+)\s*г;\s*насыщенные\s*([\d.,<]+)\s*г;\s*мононенасыщенные\s*([\d.,<]+)\s*г;\s*полиненасыщенные\s*([\d.,<]+)\s*г;\s*транс\s*([\d.,<]+)\s*г", block, re.IGNORECASE)
+    if m:
+        def to_float(x: str):
+            x = x.replace(",", ".").replace("<", "0.")
+            try: return float(x)
+            except: return None
+        fats.update({
+            "total": to_float(m.group(1)),
+            "saturated": to_float(m.group(2)),
+            "mono": to_float(m.group(3)),
+            "poly": to_float(m.group(4)),
+            "trans": to_float(m.group(5)),
+        })
+    m = re.search(r"Омега:\s*омега-?6\s*([\d.,]+)\s*г;\s*омега-?3\s*([\d.,]+)\s*г\s*\(соотношение\s*([\d:.]+)\)", block, re.IGNORECASE)
+    if m:
+        def to_f(x: str):
+            x = x.replace(",", ".")
+            try: return float(x)
+            except: return None
+        fats.update({"omega6": to_f(m.group(1)), "omega3": to_f(m.group(2)), "omega_ratio": m.group(3)})
+    if fats:
+        data["extras"]["fats"] = fats
+
+    # Клетчатка (общая / растворимая / нерастворимая)
+    # Пример: Клетчатка: всего 8 г (растворимая 3 г, нерастворимая 5 г)
+    fiber = {}
+    m = re.search(r"Клетчатка:\s*всего\s*([\d.,]+)\s*г\s*\(растворимая\s*([\d.,]+)\s*г,\s*нерастворимая\s*([\d.,]+)\s*г\)", block, re.IGNORECASE)
+    if m:
+        def tf(x):
+            x = x.replace(",", ".")
+            try: return float(x)
+            except: return None
+        fiber.update({"total": tf(m.group(1)), "soluble": tf(m.group(2)), "insoluble": tf(m.group(3))})
+    elif (m2 := re.search(r"Клетчатка:\s*всего\s*([\d.,]+)\s*г", block, re.IGNORECASE)):
+        x = m2.group(1).replace(",", ".")
+        try:
+            fiber.update({"total": float(x)})
+        except:
+            pass
+    if fiber:
+        data["extras"]["fiber"] = fiber
 
     # Флаги диеты
     m = re.search(r"vegetarian:\s*(да|нет).*vegan:\s*(да|нет)", block)
