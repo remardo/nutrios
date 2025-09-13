@@ -103,6 +103,9 @@ FORMAT_INSTRUCTIONS_RU = """
 Порция: ~ {PORTION} г  ·  доверие {CONF}%
 Калории: {KCAL} ккал
 БЖУ: белки {P} г · жиры {F} г · углеводы {C} г
+Жиры подробно: всего {F_TOTAL} г; насыщенные {F_SAT} г; мононенасыщенные {F_MONO} г; полиненасыщенные {F_POLY} г; транс {F_TRANS} г
+Омега: омега-6 {OMEGA6} г; омега-3 {OMEGA3} г (соотношение {OMEGA_RATIO})
+Клетчатка: всего {FIBER_TOTAL} г (растворимая {FIBER_SOL} г, нерастворимая {FIBER_INSOL} г)
 Ключевые микроэлементы (топ-5):
 • {MICRO1}
 • {MICRO2}
@@ -128,7 +131,7 @@ SYSTEM_SIMPLE = (
 
 REVISE_RULES = (
     "Ниже твой прошлый ответ в нужном формате. Пользователь прислал уточнение/поправку.\n"
-    "Перепиши блок, аккуратно исправив ТОЛЬКО ошибочные части (например, название, состав, порцию, флаги, БЖУ), остальное оставь как было.\n"
+    "Перепиши блок, аккуратно исправив ТОЛЬКО ошибочные части (например, название, состав, порцию, флаги, БЖУ, жиры подробно, омега, клетчатка), остальное оставь как было.\n"
     "Формат и макет должны остаться теми же. В конце блока ничего не добавляй."
 )
 
@@ -150,7 +153,9 @@ async def llm_render_from_image(image_data_url: str, hint_text: str = "") -> str
         messages=[{"role":"user","content": user_parts}],
         temperature=1
     )
-    return resp.choices[0].message.content.strip()
+    content = resp.choices[0].message.content.strip()
+    content = await ensure_fat_fiber_sections(content)
+    return content
 
 async def llm_render_from_text(text: str) -> str:
     prompt = SYSTEM_SIMPLE + "\n\n" + FORMAT_INSTRUCTIONS_RU.replace("{SOURCE}", "описанию") + "\nОписание: " + text
@@ -165,6 +170,7 @@ async def llm_render_from_text(text: str) -> str:
     )
     # normalize SDK difference
     content = (resp.choices[0].message.content if hasattr(resp.choices[0], "message") else resp.choices[0].content).strip()
+    content = await ensure_fat_fiber_sections(content)
     return content
 
 async def llm_revise(previous_block: str, correction_text: str) -> str:
@@ -203,12 +209,42 @@ def _send_ingest_from_block(
             "flags": parsed.get("flags", {}),
             "micronutrients": parsed.get("micronutrients", []),
             "assumptions": parsed.get("assumptions", []),
+            "extras": parsed.get("extras", {}),
             "source_type": source_type,
             "image_path": image_path,
             "message_id": message_id
         })
     except Exception as e:
         log.exception("Failed to ingest meal", exc_info=e)
+
+# Пост-проверка: если LLM не выдала секции жиров/омега/клетчатка — аккуратно допрашиваем и дописываем их.
+async def ensure_fat_fiber_sections(block: str) -> str:
+    needs_fats = ("Жиры подробно:" not in block)
+    needs_omega = ("Омега:" not in block)
+    needs_fiber = ("Клетчатка:" not in block)
+    if not (needs_fats or needs_omega or needs_fiber):
+        return block
+    try:
+        missing_list = ", ".join([
+            s for s, cond in [("жиры подробно", needs_fats), ("омега", needs_omega), ("клетчатка", needs_fiber)] if cond
+        ])
+        revise_system = (
+            "Ты редактор. Вставь в переданный блок отсутствующие строки для 'Жиры подробно', 'Омега' и 'Клетчатка' в соответствии с заданным форматом. "
+            "Сохрани весь остальной текст без изменений. Если точных данных нет — поставь реалистичные оценки и единицы (г). "
+            "Строго верни только обновлённый блок без комментариев."
+        )
+        user_req = f"Отсутствуют: {missing_list}. Добавь соответствующие строки ровно в те места формата после БЖУ."
+        resp = client.chat.completions.create(
+            model=MODEL_TEXT,
+            messages=[
+                {"role": "system", "content": revise_system},
+                {"role": "user", "content": "Текущий блок:\n" + block},
+                {"role": "user", "content": user_req},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return block
 
 # ------------- HANDLERS -------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
