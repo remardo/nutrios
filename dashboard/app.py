@@ -273,3 +273,37 @@ micro = requests.get(f"{API}/clients/{client_id}/micro/top", headers=HDR).json()
 if micro:
     mdf = pd.DataFrame(micro)
     st.bar_chart(mdf.set_index("name_amount")["count"])
+
+st.markdown("---")
+
+st.subheader("Жиры подробно и клетчатка — по дням")
+ex_daily = requests.get(f"{API}/clients/{client_id}/extras/daily", headers=HDR).json()
+edf = pd.DataFrame(ex_daily)
+if not edf.empty:
+    edf["period_start"] = pd.to_datetime(edf["period_start"])
+    cols_fats = [c for c in ["fats_total","fats_saturated","fats_mono","fats_poly","fats_trans"] if c in edf.columns]
+    cols_fiber = [c for c in ["fiber_total","fiber_soluble","fiber_insoluble"] if c in edf.columns]
+    if cols_fats:
+        st.line_chart(edf.set_index("period_start")[cols_fats])
+    if cols_fiber:
+        st.line_chart(edf.set_index("period_start")[cols_fiber])
+    if "omega6" in edf.columns and "omega3" in edf.columns:
+        st.line_chart(edf.set_index("period_start")[["omega6","omega3"]])
+    if "omega_ratio_num" in edf.columns:
+        st.line_chart(edf.set_index("period_start")[["omega_ratio_num"]])
+
+st.subheader("Жиры подробно и клетчатка — по неделям")
+ex_weekly = requests.get(f"{API}/clients/{client_id}/extras/weekly", headers=HDR).json()
+ewf = pd.DataFrame(ex_weekly)
+if not ewf.empty:
+    ewf["period_start"] = pd.to_datetime(ewf["period_start"])
+    cols_fats_w = [c for c in ["fats_total","fats_saturated","fats_mono","fats_poly","fats_trans"] if c in ewf.columns]
+    cols_fiber_w = [c for c in ["fiber_total","fiber_soluble","fiber_insoluble"] if c in ewf.columns]
+    if cols_fats_w:
+        st.line_chart(ewf.set_index("period_start")[cols_fats_w])
+    if cols_fiber_w:
+        st.line_chart(ewf.set_index("period_start")[cols_fiber_w])
+    if "omega6" in ewf.columns and "omega3" in ewf.columns:
+        st.line_chart(ewf.set_index("period_start")[["omega6","omega3"]])
+    if "omega_ratio_num" in ewf.columns:
+        st.line_chart(ewf.set_index("period_start")[["omega_ratio_num"]])

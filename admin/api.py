@@ -7,7 +7,7 @@ from datetime import datetime
 from .db import SessionLocal, init_db, ensure_meals_extras_column
 from .models import Base, Client, Meal
 from .auth import require_api_key
-from .analysis import df_meals, summary_macros, micro_top
+from .analysis import df_meals, summary_macros, summary_extras, micro_top
 
 app = FastAPI(title="Nutrios Admin API")
 
@@ -110,3 +110,35 @@ def json_safe(df):
             "fat_g": float(r["fat_g"]), "carbs_g": float(r["carbs_g"]),
         })
     return out
+
+def json_safe_extras(df):
+    if df is None or getattr(df, "empty", True):
+        return []
+    out = []
+    for _, r in df.iterrows():
+        row = {"period_start": (r["captured_at"].to_pydatetime() if hasattr(r["captured_at"], "to_pydatetime") else r["captured_at"]).isoformat()}
+        for k in [
+            "fats_total","fats_saturated","fats_mono","fats_poly","fats_trans",
+            "omega6","omega3","omega_ratio_num","fiber_total","fiber_soluble","fiber_insoluble"
+        ]:
+            if k in df.columns:
+                val = r[k]
+                if val is not None:
+                    try:
+                        row[k] = float(val)
+                    except Exception:
+                        pass
+        out.append(row)
+    return out
+
+@app.get("/clients/{client_id}/extras/daily")
+def daily_extras(client_id: int, db: Session = Depends(get_db)):
+    df = df_meals(db, client_id)
+    agg = summary_extras(df, freq="D")
+    return json_safe_extras(agg)
+
+@app.get("/clients/{client_id}/extras/weekly")
+def weekly_extras(client_id: int, db: Session = Depends(get_db)):
+    df = df_meals(db, client_id)
+    agg = summary_extras(df, freq="W")
+    return json_safe_extras(agg)
