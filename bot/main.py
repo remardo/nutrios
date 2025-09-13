@@ -15,8 +15,8 @@
 # .env (root or bot/):
 #   TELEGRAM_BOT_TOKEN=...
 #   OPENAI_API_KEY=...
-#   OPENAI_VISION_MODEL=gpt-4o-mini
-#   OPENAI_TEXT_MODEL=gpt-4o-mini
+#   OPENAI_VISION_MODEL=gpt-5
+#   OPENAI_TEXT_MODEL=gpt-5
 #   ADMIN_API_BASE=http://localhost:8000
 #   ADMIN_API_KEY=supersecret
 
@@ -45,8 +45,8 @@ else:
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-MODEL_VISION = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
-MODEL_TEXT   = os.getenv("OPENAI_TEXT_MODEL",   "gpt-4o-mini")
+MODEL_VISION = os.getenv("OPENAI_VISION_MODEL", "gpt-5")
+MODEL_TEXT   = os.getenv("OPENAI_TEXT_MODEL",   "gpt-5")
 
 if not TELEGRAM_TOKEN or not OPENAI_KEY:
     raise SystemExit("Set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY in .env")
@@ -154,8 +154,7 @@ async def llm_render_from_image(image_data_url: str, hint_text: str = "") -> str
         user_parts.append({"type": "text", "text": f"Подпись/подсказка пользователя: {hint_text}"})
     resp = client.chat.completions.create(
         model=MODEL_VISION,
-        messages=[{"role":"user","content": user_parts}],
-        temperature=0.2
+        messages=[{"role":"user","content": user_parts}]
     )
     return resp.choices[0].message.content.strip()
 
@@ -163,12 +162,10 @@ async def llm_render_from_text(text: str) -> str:
     prompt = SYSTEM_SIMPLE + "\n\n" + FORMAT_INSTRUCTIONS_RU.replace("{SOURCE}", "описанию") + "\nОписание: " + text
     resp = client.chat_completions.create(  # fallback for SDK variations
         model=MODEL_TEXT,
-        messages=[{"role":"user","content": prompt}],
-        temperature=0.2
+        messages=[{"role":"user","content": prompt}]
     ) if hasattr(client, "chat_completions") else client.chat.completions.create(
         model=MODEL_TEXT,
-        messages=[{"role":"user","content": prompt}],
-        temperature=0.2
+        messages=[{"role":"user","content": prompt}]
     )
     # normalize SDK difference
     content = (resp.choices[0].message.content if hasattr(resp.choices[0], "message") else resp.choices[0].content).strip()
@@ -181,8 +178,7 @@ async def llm_revise(previous_block: str, correction_text: str) -> str:
             {"role":"system","content": REVISE_RULES},
             {"role":"user","content": "Твой прошлый ответ:\n" + previous_block},
             {"role":"user","content": "Коррекция пользователя:\n" + correction_text}
-        ],
-        temperature=0.2
+        ]
     )
     return resp.choices[0].message.content.strip()
 
@@ -367,6 +363,7 @@ MENU_CB_HELP = "MENU_HELP"
 MENU_CB_ABOUT = "MENU_ABOUT"
 MENU_CB_DAILY = "MENU_DAILY"
 MENU_CB_WEEKLY = "MENU_WEEKLY"
+MENU_CB_DAILY_DETAILS = "MENU_DAILY_DETAILS"
 
 def menu_keyboard():
     return InlineKeyboardMarkup([
@@ -377,6 +374,9 @@ def menu_keyboard():
         [
             InlineKeyboardButton("📊 За сегодня", callback_data=MENU_CB_DAILY),
             InlineKeyboardButton("📆 За неделю", callback_data=MENU_CB_WEEKLY)
+        ],
+        [
+            InlineKeyboardButton("🧾 За сегодня подробно", callback_data=MENU_CB_DAILY_DETAILS)
         ]
     ])
 
@@ -386,7 +386,7 @@ INSTRUCTION_TEXT = (
     "2. Можно описать блюдо текстом.\n"
     "3. Уточнения: сообщение со словами ‘добавь’, ‘убери’, ‘без’, ‘ещё/еще’, ‘поменяй’, или ответ реплаем на мой блок.\n"
     "4. /menu — показать это меню.\n"
-    "5. Сводки: кнопки ‘За сегодня’ и ‘За неделю’."
+    "5. Сводки: кнопки ‘За сегодня’, ‘За неделю’ и ‘За сегодня подробно’."
 )
 
 ABOUT_TEXT = (
@@ -488,6 +488,71 @@ async def _build_weekly_text(telegram_user_id: int) -> str:
             return txt
         return "Нет данных за неделю."
 
+async def _build_daily_details_text(telegram_user_id: int, chat_id: int | None = None) -> str:
+    """Краткий список блюд за сегодня: номер, дата/время, название, калории и БЖУ, порция и доверие."""
+    try:
+        now = datetime.now(timezone.utc)
+        start = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT created_at, bot_output FROM interactions
+            WHERE chat_id=? AND created_at>=? AND created_at<?
+            ORDER BY created_at ASC
+            """,
+            ((chat_id or telegram_user_id), start.isoformat(), end.isoformat()),
+        )
+        rows = c.fetchall()
+        conn.close()
+    except Exception:
+        rows = []
+    try:
+        log.info(
+            "DAILY_DETAILS: user_id=%s chat_id=%s used_id=%s start=%s end=%s rows=%s",
+            telegram_user_id, chat_id, (chat_id or telegram_user_id), start.isoformat(), end.isoformat(), len(rows)
+        )
+    except Exception:
+        pass
+
+    if not rows:
+        return "🧾 За сегодня подробно\nСегодня ещё нет блюд."
+
+    def _num(v):
+        try:
+            return int(round(float(v or 0)))
+        except Exception:
+            return 0
+
+    lines = []
+    for idx, (created_at_iso, text) in enumerate(rows, start=1):
+        try:
+            parsed = parse_formatted_block(text)
+        except Exception:
+            continue
+        title = parsed.get("title") or "Блюдо"
+        portion = _num(parsed.get("portion_g"))
+        kcal = _num(parsed.get("kcal"))
+        p = _num(parsed.get("protein_g"))
+        f = _num(parsed.get("fat_g"))
+        carb = _num(parsed.get("carbs_g"))
+        # доверие убираем из вывода
+        try:
+            dt_local = datetime.fromisoformat(created_at_iso).astimezone()
+            dt_s = dt_local.strftime("%H:%M")
+        except Exception:
+            dt_s = created_at_iso[11:16]
+        lines.append(
+            f"{idx}. {dt_s} — {title} · ~{portion} г · {kcal} ккал · Б:{p} г Ж:{f} г У:{carb} г"
+        )
+
+    try:
+        log.info("DAILY_DETAILS: built lines=%s for used_id=%s", len(lines), (chat_id or telegram_user_id))
+    except Exception:
+        pass
+    return "🧾 За сегодня подробно\n" + "\n".join(lines)
+
 def _sum_local_for_period(telegram_user_id: int, start_utc: datetime, end_utc: datetime):
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -559,6 +624,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = await _build_daily_text(query.from_user.id)
         elif data == MENU_CB_WEEKLY:
             text = await _build_weekly_text(query.from_user.id)
+        elif data == MENU_CB_DAILY_DETAILS:
+            text = await _build_daily_details_text(query.from_user.id, chat_id=(query.message.chat_id if query.message else None))
         else:
             text = "Неизвестный пункт меню."
     except Exception as e:
