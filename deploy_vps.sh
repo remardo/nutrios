@@ -155,7 +155,7 @@ After=network.target nutrios-api.service
 User=$CURRENT_USER
 WorkingDirectory=$PROJECT_DIR
 Environment=PATH=$PROJECT_DIR/.venv/bin
-ExecStart=$PROJECT_DIR/.venv/bin/python main.py
+ExecStart=$PROJECT_DIR/.venv/bin/python bot/main.py
 Restart=always
 RestartSec=5
 

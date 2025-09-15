@@ -15,7 +15,7 @@ else
 fi
 
 # Kill Bot
-BOT_PID=$(pgrep -f "python main.py")
+BOT_PID=$(pgrep -f "python bot/main.py")
 if [ ! -z "$BOT_PID" ]; then
     kill $BOT_PID
     echo "Bot stopped (PID: $BOT_PID)"

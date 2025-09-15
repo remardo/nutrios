@@ -35,7 +35,7 @@ Follow the step-by-step guide below.
 
 1. **Run the deployment script:**
    ```bash
-   wget https://raw.githubusercontent.com/your-repo/main/deploy_vps.sh
+   wget https://raw.githubusercontent.com/remardo/nutrios/master/deploy_vps.sh
    chmod +x deploy_vps.sh
    ./deploy_vps.sh
    ```
@@ -109,7 +109,7 @@ sudo apt install -y screen
 
 # Start services
 screen -dmS api bash -c "cd /path/to/nutrios && source .venv/bin/activate && python run_api.py"
-screen -dmS bot bash -c "cd /path/to/nutrios && source .venv/bin/activate && python main.py"
+screen -dmS bot bash -c "cd /path/to/nutrios && source .venv/bin/activate && python bot/main.py"
 screen -dmS dashboard bash -c "cd /path/to/nutrios && source .venv/bin/activate && streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0"
 
 # Attach to sessions

@@ -21,7 +21,7 @@ sleep 5
 
 # Start Telegram bot in background
 echo "Starting Telegram bot..."
-nohup python main.py > bot.log 2>&1 &
+nohup python bot/main.py > bot.log 2>&1 &
 BOT_PID=$!
 echo "Bot started with PID $BOT_PID"
 

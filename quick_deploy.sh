@@ -15,7 +15,7 @@ pip install -r requirements.txt
 
 # Start services in screen
 screen -dmS nutrios-api bash -c "source .venv/bin/activate && python run_api.py"
-screen -dmS nutrios-bot bash -c "source .venv/bin/activate && python main.py"
+screen -dmS nutrios-bot bash -c "source .venv/bin/activate && python bot/main.py"
 screen -dmS nutrios-dashboard bash -c "source .venv/bin/activate && streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0"
 
 echo "Services started in screen sessions:"
