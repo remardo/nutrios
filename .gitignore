@@ -61,7 +61,14 @@ npm-debug.log*
 
 # Downloads and uploads
 downloads/
+bot/downloads/
 uploads/
 
 # System files
 systemd/
+
+# Local state and artifacts
+state.db
+state_simple.db
+run_all.out.log
+run_all.err.log

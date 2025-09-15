@@ -159,7 +159,9 @@ async def llm_render_from_image(image_data_url: str, hint_text: str = "") -> str
         model=MODEL_VISION,
         messages=[{"role":"user","content": user_parts}]
     )
-    return resp.choices[0].message.content.strip()
+    content = resp.choices[0].message.content.strip()
+    content = await ensure_fat_fiber_sections(content)
+    return content
 
 async def llm_render_from_text(text: str) -> str:
     prompt = SYSTEM_SIMPLE + "\n\n" + FORMAT_INSTRUCTIONS_RU.replace("{SOURCE}", "описанию") + "\nОписание: " + text
@@ -172,6 +174,7 @@ async def llm_render_from_text(text: str) -> str:
     )
     # normalize SDK difference
     content = (resp.choices[0].message.content if hasattr(resp.choices[0], "message") else resp.choices[0].content).strip()
+    content = await ensure_fat_fiber_sections(content)
     return content
 
 async def llm_revise(previous_block: str, correction_text: str) -> str:
@@ -217,6 +220,35 @@ def _send_ingest_from_block(
     except Exception as e:
         log.exception("Failed to ingest meal", exc_info=e)
 
+# Ensure sections for detailed fats, omega, fiber are present; if missing, ask LLM to revise-insert them.
+async def ensure_fat_fiber_sections(block: str) -> str:
+    needs_fats = ("Жиры подробно:" not in block)
+    needs_omega = ("Омега:" not in block)
+    needs_fiber = ("Клетчатка:" not in block)
+    if not (needs_fats or needs_omega or needs_fiber):
+        return block
+    try:
+        missing_list = ", ".join([
+            s for s, cond in [("жиры подробно", needs_fats),("омега", needs_omega),("клетчатка", needs_fiber)] if cond
+        ])
+        revise_system = (
+            "Ты редактор. Вставь в переданный блок отсутствующие строки для 'Жиры подробно', 'Омега' и 'Клетчатка' в соответствии с заданным форматом. "
+            "Сохрани весь остальной текст без изменений. Если точных данных нет — поставь реалистичные оценки и единицы (г). "
+            "Строго верни только обновлённый блок без комментариев."
+        )
+        user_req = f"Отсутствуют: {missing_list}. Добавь соответствующие строки ровно в те места формата после БЖУ."
+        resp = client.chat.completions.create(
+            model=MODEL_TEXT,
+            messages=[
+                {"role":"system","content": revise_system},
+                {"role":"user","content": "Текущий блок:\n" + block},
+                {"role":"user","content": user_req},
+            ],
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return block
+
 # ------------- HANDLERS -------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -240,13 +272,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         block = await llm_render_from_image(encode_image_to_data_url(local_path), caption)
     except Exception as e:
         log.exception("LLM image render failed", exc_info=e)
-        block = (
-            "🍽️ Разбор блюда (оценка по фото)\nБлюдо (ассорти).\nПорция: ~ 300 г  ·  доверие 60%\n"
-            "Калории: 360 ккал\nБЖУ: белки 15 г · жиры 15 г · углеводы 45 г\n"
-            "Ключевые микроэлементы (топ-5):\n• Клетчатка — 6 g\n• Витамин C — 30 mg\n"
-            "Флаги диеты:\n• vegetarian: нет  ·  vegan: нет\n• glutenfree: нет  ·  lactosefree: нет\n"
-            "Допущения:\n• Оценка по фото.\n• Ингредиенты и масса — приблизительно."
-        )
+        await update.message.reply_text("Не удалось распознать блюдо по фото. Попробуйте ещё раз или пришлите другое изображение.")
+        return
 
     sent = await update.message.reply_text(block)
 
@@ -305,13 +332,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         block = await llm_render_from_text(text)
     except Exception as e:
         log.exception("LLM text render failed", exc_info=e)
-        block = (
-            "🍽️ Разбор блюда (оценка по описанию)\nБлюдо (ассорти).\nПорция: ~ 300 г  ·  доверие 60%\n"
-            "Калории: 360 ккал\nБЖУ: белки 15 г · жиры 15 г · углеводы 45 г\n"
-            "Ключевые микроэлементы (топ-5):\n• Клетчатка — 6 g\n• Витамин C — 30 mg\n"
-            "Флаги диеты:\n• vegetarian: нет  ·  vegan: нет\n• glutenfree: нет  ·  lactosefree: нет\n"
-            "Допущения:\n• Оценка по описанию.\n• Ингредиенты и масса — приблизительно."
-        )
+        await update.message.reply_text("Не удалось распознать блюдо по описанию. Попробуйте переформулировать.")
+        return
     sent = await update.message.reply_text(block)
 
     # Admin ingestion

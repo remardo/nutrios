@@ -1,8 +1,7 @@
-import os, httpx
+import logging
+import httpx
 from typing import Dict, Any
-
-ADMIN_API_BASE = os.getenv("ADMIN_API_BASE", "http://localhost:8000")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "supersecret")
+from config import ADMIN_API_BASE, ADMIN_API_KEY
 
 def ingest_meal(payload: Dict[str, Any]) -> None:
     """
@@ -13,6 +12,15 @@ def ingest_meal(payload: Dict[str, Any]) -> None:
       source_type ('image'|'text'), image_path(optional), message_id
     """
     with httpx.Client(timeout=10.0) as client:
-        client.post(f"{ADMIN_API_BASE}/ingest/meal",
-                    headers={"x-api-key": ADMIN_API_KEY},
-                    json=payload)
+        try:
+            r = client.post(
+                f"{ADMIN_API_BASE}/ingest/meal",
+                headers={"x-api-key": ADMIN_API_KEY},
+                json=payload,
+            )
+            if r.status_code >= 400:
+                logging.getLogger(__name__).warning(
+                    "Admin ingest failed: %s %s", r.status_code, r.text[:200]
+                )
+        except Exception as e:
+            logging.getLogger(__name__).warning("Admin ingest error: %s", e)

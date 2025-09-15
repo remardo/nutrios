@@ -8,8 +8,8 @@
 # .env (root or bot/):
 #   TELEGRAM_BOT_TOKEN=...
 #   OPENAI_API_KEY=...
-#   OPENAI_VISION_MODEL=gpt-4o-mini
-#   OPENAI_TEXT_MODEL=gpt-4o-mini
+#   OPENAI_VISION_MODEL=gpt-5
+#   OPENAI_TEXT_MODEL=gpt-5
 #   ADMIN_API_BASE=http://localhost:8000
 #   ADMIN_API_KEY=supersecret
 
@@ -38,8 +38,8 @@ else:
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-MODEL_VISION = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
-MODEL_TEXT   = os.getenv("OPENAI_TEXT_MODEL",   "gpt-4o-mini")
+MODEL_VISION = os.getenv("OPENAI_VISION_MODEL", "gpt-5")
+MODEL_TEXT   = os.getenv("OPENAI_TEXT_MODEL",   "gpt-5")
 
 if not TELEGRAM_TOKEN or not OPENAI_KEY:
     raise SystemExit("Set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY in .env")
@@ -54,45 +54,70 @@ client = OpenAI(api_key=OPENAI_KEY)
 # ------------- DB (SQLite) -------------
 DB_PATH = os.path.join(os.path.dirname(__file__), "state_simple.db")
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS interactions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER, original_message_id INTEGER, bot_message_id INTEGER,
-        mode TEXT,                     -- 'image' or 'text'
-        original_hint TEXT,            -- caption or text
-        bot_output TEXT,               -- last rendered formatted text
-        created_at TEXT, updated_at TEXT
-    )""")
-    conn.commit(); conn.close()
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS interactions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER, original_message_id INTEGER, bot_message_id INTEGER,
+                mode TEXT,                     -- 'image' or 'text'
+                original_hint TEXT,            -- caption or text
+                bot_output TEXT,               -- last rendered formatted text
+                created_at TEXT, updated_at TEXT
+            )"""
+        )
+        conn.commit()
 
-def save_interaction(chat_id, original_message_id, bot_message_id, mode, hint, bot_output):
+def save_interaction(
+    chat_id: int,
+    original_message_id: int,
+    bot_message_id: int,
+    mode: str,
+    hint: str,
+    bot_output: str,
+) -> None:
     ts = datetime.now(timezone.utc).isoformat()
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("""INSERT INTO interactions(chat_id, original_message_id, bot_message_id, mode, original_hint, bot_output, created_at, updated_at)
-                 VALUES(?,?,?,?,?,?,?,?)""",
-              (chat_id, original_message_id, bot_message_id, mode, hint, bot_output, ts, ts))
-    conn.commit(); conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO interactions(chat_id, original_message_id, bot_message_id, mode, original_hint, bot_output, created_at, updated_at)
+                     VALUES(?,?,?,?,?,?,?,?)""",
+            (chat_id, original_message_id, bot_message_id, mode, hint, bot_output, ts, ts),
+        )
+        conn.commit()
 
-def update_interaction_bot_output(bot_message_id, new_text):
+def update_interaction_bot_output(bot_message_id: int, new_text: str) -> None:
     ts = datetime.now(timezone.utc).isoformat()
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("""UPDATE interactions SET bot_output=?, updated_at=? WHERE bot_message_id=?""",
-              (new_text, ts, bot_message_id))
-    conn.commit(); conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """UPDATE interactions SET bot_output=?, updated_at=? WHERE bot_message_id=?""",
+            (new_text, ts, bot_message_id),
+        )
+        conn.commit()
 
-def get_interaction_by_bot_message_id(bot_message_id):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("""SELECT id, chat_id, original_message_id, bot_message_id, mode, original_hint, bot_output
-                 FROM interactions WHERE bot_message_id=?""", (bot_message_id,))
-    row = c.fetchone(); conn.close(); return row
+def get_interaction_by_bot_message_id(bot_message_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """SELECT id, chat_id, original_message_id, bot_message_id, mode, original_hint, bot_output
+                     FROM interactions WHERE bot_message_id=?""",
+            (bot_message_id,),
+        )
+        row = c.fetchone()
+    return row
 
-def get_last_interaction_by_chat(chat_id):
-    conn = sqlite3.connect(DB_PATH); c = conn.cursor()
-    c.execute("""SELECT id, chat_id, original_message_id, bot_message_id, mode, original_hint, bot_output
-                 FROM interactions WHERE chat_id=? ORDER BY id DESC LIMIT 1""", (chat_id,))
-    row = c.fetchone(); conn.close(); return row
+def get_last_interaction_by_chat(chat_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """SELECT id, chat_id, original_message_id, bot_message_id, mode, original_hint, bot_output
+                     FROM interactions WHERE chat_id=? ORDER BY id DESC LIMIT 1""",
+            (chat_id,),
+        )
+        row = c.fetchone()
+    return row
 
 # ------------- PROMPTS -------------
 FORMAT_INSTRUCTIONS_RU = """
@@ -515,17 +540,16 @@ async def _build_weekly_text(telegram_user_id: int) -> str:
 
 def _sum_local_for_period(telegram_user_id: int, start_utc: datetime, end_utc: datetime):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            """
-            SELECT bot_output FROM interactions
-            WHERE chat_id=? AND created_at>=? AND created_at<?
-            """,
-            (telegram_user_id, start_utc.isoformat(), end_utc.isoformat()),
-        )
-        rows = c.fetchall()
-        conn.close()
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                """
+                SELECT bot_output FROM interactions
+                WHERE chat_id=? AND created_at>=? AND created_at<?
+                """,
+                (telegram_user_id, start_utc.isoformat(), end_utc.isoformat()),
+            )
+            rows = c.fetchall()
         kcal = p = f = carb = 0.0
         for (text,) in rows:
             try:

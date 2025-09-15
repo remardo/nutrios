@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nutrios Mini App</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  </head>
+  <body>
+    <header>
+      <div class="brand">🥗 Nutrios</div>
+      <div class="sub">Ежедневная и недельная статистика</div>
+    </header>
+
+    <main>
+      <section class="card">
+        <div class="section-title">Цели (план)</div>
+        <div id="targets" class="grid kpis"></div>
+        <button id="editTargets" class="btn">Изменить цели</button>
+      </section>
+
+      <section class="card">
+        <div class="section-title">Прогресс за сегодня</div>
+        <div id="progressDaily" class="grid kpis"></div>
+        <canvas id="chartDaily" height="140"></canvas>
+      </section>
+
+      <section class="card">
+        <div class="section-title">Прогресс за неделю</div>
+        <div id="progressWeekly" class="grid kpis"></div>
+        <canvas id="chartWeekly" height="160"></canvas>
+      </section>
+
+      <section class="card">
+        <div class="section-title">Опросник (цели и состояние)</div>
+        <form id="quiz" class="form-grid">
+          <label>Возраст<input type="number" name="age" min="10" max="100" /></label>
+          <label>Пол<select name="sex"><option value="m">Муж</option><option value="f">Жен</option></select></label>
+          <label>Рост, см<input type="number" name="height_cm" min="100" max="230" /></label>
+          <label>Вес, кг<input type="number" name="weight_kg" min="30" max="250" step="0.1" /></label>
+          <label>Активность<select name="activity"><option value="low">Низкая</option><option value="medium" selected>Средняя</option><option value="high">Высокая</option></select></label>
+          <label>Цель<select name="goal"><option value="lose">Похудение</option><option value="maintain" selected>Поддержание</option><option value="gain">Набор</option></select></label>
+          <button class="btn" type="submit">Рассчитать план</button>
+        </form>
+      </section>
+
+      <section class="card">
+        <div class="section-title">Серия соблюдения (streak)</div>
+        <div id="streak" class="streak"></div>
+      </section>
+    </main>
+
+    <footer>
+      <button id="refresh" class="btn">Обновить</button>
+    </footer>
+
+    <script src="./app.js?v=20250916-2"></script>
+  </body>
+  </html>

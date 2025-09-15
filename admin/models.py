@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, Float, String, Boolean, ForeignKey, Date
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 from .db import Base
+from sqlalchemy import UniqueConstraint
 
 class Client(Base):
     __tablename__ = "clients"
@@ -35,3 +36,19 @@ class Meal(Base):
 
     client = relationship("Client", back_populates="meals")
     __table_args__ = (UniqueConstraint('client_id', 'message_id', name='uq_client_message'),)
+
+
+class ClientTargets(Base):
+    __tablename__ = "client_targets"
+    id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), index=True, unique=True)
+    kcal_target = Column(Integer, default=2000)
+    protein_target_g = Column(Integer, default=100)
+    fat_target_g = Column(Integer, default=70)
+    carbs_target_g = Column(Integer, default=250)
+    profile = Column(JSON, nullable=True)    # questionnaire answers (detailed)
+    plan = Column(JSON, nullable=True)       # generated nutrition plan summary
+    tolerances = Column(JSON, nullable=True) # {kcal_pct:0.1, protein_pct:0.2, fat_pct:0.2, carbs_pct:0.2, min_g:{p:10,f:10,c:15}}
+    notifications = Column(JSON, nullable=True) # preferences: {reminders:true, time:"08:00", tips:true}
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

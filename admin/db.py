@@ -1,4 +1,5 @@
 import os
+import logging
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
@@ -22,6 +23,6 @@ def ensure_meals_extras_column():
                     # SQLite: JSON affinity is TEXT; we use TEXT to be safe
                     conn.execute(text("ALTER TABLE meals ADD COLUMN extras TEXT"))
                     conn.commit()
-    except Exception:
+    except Exception as e:
         # Best-effort; API can still run without extras column until next restart
-        pass
+        logging.getLogger(__name__).warning("ensure_meals_extras_column failed: %s", e)
