@@ -4,11 +4,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from .db import SessionLocal, init_db, ensure_meals_extras_column
-from .models import Base, Client, Meal, ClientTargets
+from .models import Base, Client, Meal, ClientTargets, ClientBadgeAward
 from .auth import require_api_key
 from .analysis import df_meals, summary_macros, summary_extras, micro_top
+from .badges import evaluate_badges
 from dotenv import load_dotenv
 from pathlib import Path
 
@@ -400,6 +401,66 @@ def json_safe(df):
             "fat_g": float(r["fat_g"]), "carbs_g": float(r["carbs_g"]),
         })
     return out
+
+
+class BadgeResponse(BaseModel):
+    code: str
+    title: str
+    earned: bool
+    progress: float
+    latest_award_at: Optional[str] = None
+
+
+def refresh_client_badges(db: Session, client_id: int) -> List[dict]:
+    statuses = evaluate_badges(db, client_id)
+    existing = {
+        r.badge_code: r
+        for r in db.query(ClientBadgeAward).filter(ClientBadgeAward.client_id == client_id).all()
+    }
+    new_awards: List[ClientBadgeAward] = []
+    now = datetime.now(timezone.utc)
+    results: List[dict] = []
+    for badge in statuses:
+        code = badge.get("code")
+        title = badge.get("title")
+        progress_value = badge.get("progress") or 0.0
+        try:
+            progress = float(progress_value)
+        except Exception:
+            progress = 0.0
+        progress = max(0.0, min(1.0, progress))
+        award = existing.get(code)
+        latest_at = award.awarded_at if award else None
+        if badge.get("earned") and award is None:
+            award = ClientBadgeAward(client_id=client_id, badge_code=code, awarded_at=now)
+            db.add(award)
+            new_awards.append(award)
+            latest_at = award.awarded_at
+            existing[code] = award
+        if latest_at and latest_at.tzinfo is None:
+            latest_at = latest_at.replace(tzinfo=timezone.utc)
+        results.append(
+            {
+                "code": code,
+                "title": title,
+                "earned": award is not None,
+                "progress": progress,
+                "latest_award_at": latest_at.isoformat() if latest_at else None,
+            }
+        )
+    if new_awards:
+        db.commit()
+    return results
+
+
+@app.get("/clients/{client_id}/badges", response_model=List[BadgeResponse])
+def get_client_badges(client_id: int, db: Session = Depends(get_db)):
+    return refresh_client_badges(db, client_id)
+
+
+@app.post("/clients/{client_id}/badges", response_model=List[BadgeResponse])
+def post_client_badges(client_id: int, db: Session = Depends(get_db)):
+    return refresh_client_badges(db, client_id)
 
 def json_safe_extras(df):
     if df is None or getattr(df, "empty", True):

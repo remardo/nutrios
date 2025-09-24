@@ -2,7 +2,6 @@ from sqlalchemy import Column, Integer, Float, String, Boolean, ForeignKey, Date
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 from .db import Base
-from sqlalchemy import UniqueConstraint
 
 class Client(Base):
     __tablename__ = "clients"
@@ -11,6 +10,7 @@ class Client(Base):
     telegram_username = Column(String, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     meals = relationship("Meal", back_populates="client")
+    badge_awards = relationship("ClientBadgeAward", back_populates="client", cascade="all, delete-orphan")
 
 class Meal(Base):
     __tablename__ = "meals"
@@ -52,3 +52,16 @@ class ClientTargets(Base):
     notifications = Column(JSON, nullable=True) # preferences: {reminders:true, time:"08:00", tips:true}
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class ClientBadgeAward(Base):
+    __tablename__ = "client_badge_awards"
+
+    id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), index=True, nullable=False)
+    badge_code = Column(String, nullable=False)
+    awarded_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    client = relationship("Client", back_populates="badge_awards")
+
+    __table_args__ = (UniqueConstraint("client_id", "badge_code", name="uq_client_badge"),)
