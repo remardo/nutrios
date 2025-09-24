@@ -1,18 +1,38 @@
 import os, hmac, hashlib, json
-from fastapi import FastAPI, Depends, HTTPException, Header, Request
+from math import isclose
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
-from typing import List, Optional
-from datetime import datetime
-from .db import SessionLocal, init_db, ensure_meals_extras_column
-from .models import Base, Client, Meal, ClientTargets
-from .auth import require_api_key
-from .analysis import df_meals, summary_macros, summary_extras, micro_top
 from dotenv import load_dotenv
 from pathlib import Path
 
+from .ab_service import ABFlagService, ABFlagServiceError, get_ab_service
+from .analysis import df_meals, micro_top, summary_extras, summary_macros
+from .auth import AdminIdentity, require_api_key, require_roles
+from .db import SessionLocal, ensure_meals_extras_column, init_db
+from .models import (
+    Base,
+    Client,
+    ClientTargets,
+    Experiment,
+    ExperimentRevision,
+    ExperimentVariant,
+    Meal,
+)
+
 app = FastAPI(title="Nutrios Admin API")
+
+
+EXPERIMENT_STATUS_DRAFT = "draft"
+EXPERIMENT_STATUS_RUNNING = "running"
+EXPERIMENT_STATUS_PAUSED = "paused"
+
+ROLE_EXPERIMENT_WRITE = "experiments:write"
+ROLE_EXPERIMENT_PUBLISH = "experiments:publish"
 
 def get_db():
     db = SessionLocal()
@@ -325,6 +345,294 @@ def compliance_streak(client_id: int, db: Session = Depends(get_db)):
         else:
             break
     return {"streak": streak, "met_goal_7": streak >= 7}
+
+# ----- Experiments (AB testing) -----
+
+
+class VariantConfig(BaseModel):
+    name: str = Field(..., min_length=1)
+    weight: float = Field(..., ge=0)
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("variant name cannot be empty")
+        return name
+
+
+class ExperimentConfigPayload(BaseModel):
+    rollout_percentage: float = Field(..., ge=0, le=100)
+    variants: List[VariantConfig]
+
+    @model_validator(mode="after")
+    def _ensure_variants(cls, data):
+        if not data.variants:
+            raise ValueError("At least one variant must be provided")
+        return data
+
+
+def _normalize_variant_weights(variants: List[VariantConfig]) -> Dict[str, float]:
+    normalized: Dict[str, float] = {}
+    total = sum(float(v.weight) for v in variants)
+    if total <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Variant weights must sum to a positive value",
+        )
+    if isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        scale = 1.0
+    elif isclose(total, 100.0, rel_tol=1e-4, abs_tol=1e-4):
+        scale = 100.0
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Variant weights must sum to 1.0 or 100.0 (received {total:.4f})",
+        )
+    for variant in variants:
+        name = variant.name
+        if name in normalized:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Duplicate variant name '{name}'",
+            )
+        weight = float(variant.weight)
+        normalized[name] = weight if scale == 1.0 else weight / 100.0
+    if not any(weight > 0 for weight in normalized.values()):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one variant must have a non-zero weight",
+        )
+    normalized_total = sum(normalized.values())
+    if not isclose(normalized_total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        normalized = {name: weight / normalized_total for name, weight in normalized.items()}
+    return normalized
+
+
+def _serialize_experiment(experiment: Experiment) -> Dict[str, object]:
+    revisions = [rev.revision for rev in experiment.revisions] if experiment.revisions else []
+    return {
+        "id": experiment.id,
+        "key": experiment.key,
+        "description": experiment.description,
+        "rollout_percentage": float(experiment.rollout_percentage or 0.0),
+        "status": experiment.status,
+        "variants": [
+            {
+                "id": variant.id,
+                "name": variant.name,
+                "weight": float(variant.weight or 0.0),
+            }
+            for variant in sorted(experiment.variants, key=lambda v: v.name)
+        ],
+        "created_at": experiment.created_at.isoformat() if experiment.created_at else None,
+        "updated_at": experiment.updated_at.isoformat() if experiment.updated_at else None,
+        "current_revision": max(revisions) if revisions else None,
+    }
+
+
+def _serialize_revision(revision: ExperimentRevision) -> Dict[str, object]:
+    return {
+        "id": revision.id,
+        "revision": revision.revision,
+        "status": revision.status,
+        "rollout_percentage": float(revision.rollout_percentage or 0.0),
+        "variant_weights": {k: float(v) for k, v in (revision.variant_weights or {}).items()},
+        "published_by": revision.published_by,
+        "created_at": revision.created_at.isoformat() if revision.created_at else None,
+    }
+
+
+@app.put("/experiments/{experiment_key}/config")
+def update_experiment_config(
+    experiment_key: str,
+    payload: ExperimentConfigPayload,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_roles(ROLE_EXPERIMENT_WRITE)),
+):
+    experiment = db.query(Experiment).filter(Experiment.key == experiment_key).first()
+    if not experiment:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+
+    normalized_weights = _normalize_variant_weights(payload.variants)
+
+    experiment.rollout_percentage = float(payload.rollout_percentage)
+    existing = {variant.name: variant for variant in experiment.variants}
+    incoming_names = set()
+    for name, weight in normalized_weights.items():
+        incoming_names.add(name)
+        variant = existing.get(name)
+        if variant:
+            variant.weight = weight
+        else:
+            db.add(ExperimentVariant(experiment=experiment, name=name, weight=weight))
+    for name, variant in existing.items():
+        if name not in incoming_names:
+            db.delete(variant)
+
+    experiment.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(experiment)
+    return {"ok": True, "experiment": _serialize_experiment(experiment)}
+
+
+@app.post("/experiments/{experiment_key}/publish")
+def publish_experiment(
+    experiment_key: str,
+    db: Session = Depends(get_db),
+    identity: AdminIdentity = Depends(require_roles(ROLE_EXPERIMENT_PUBLISH)),
+    ab_service: ABFlagService = Depends(get_ab_service),
+):
+    experiment = db.query(Experiment).filter(Experiment.key == experiment_key).first()
+    if not experiment:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    if not experiment.variants:
+        raise HTTPException(status_code=422, detail="Experiment has no variants configured")
+
+    variant_weights = {variant.name: float(variant.weight or 0.0) for variant in experiment.variants}
+    total_weight = sum(variant_weights.values())
+    if total_weight <= 0 or not isclose(total_weight, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Experiment variants must be normalized before publishing",
+        )
+
+    last_revision = (
+        db.query(ExperimentRevision)
+        .filter(ExperimentRevision.experiment_id == experiment.id)
+        .order_by(ExperimentRevision.revision.desc())
+        .first()
+    )
+    next_revision = 1 if not last_revision else last_revision.revision + 1
+    new_status = EXPERIMENT_STATUS_RUNNING if experiment.rollout_percentage > 0 else EXPERIMENT_STATUS_PAUSED
+
+    experiment.status = new_status
+    experiment.updated_at = datetime.now(timezone.utc)
+
+    revision = ExperimentRevision(
+        experiment_id=experiment.id,
+        revision=next_revision,
+        rollout_percentage=float(experiment.rollout_percentage),
+        variant_weights=variant_weights,
+        status=new_status,
+        published_by=identity.subject,
+    )
+    db.add(revision)
+
+    try:
+        db.flush()
+        ab_service.publish_experiment(
+            experiment.key,
+            float(experiment.rollout_percentage),
+            variant_weights,
+            preserve_sticky_assignments=True,
+        )
+    except ABFlagServiceError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to publish experiment: {exc}",
+        )
+
+    db.commit()
+    db.refresh(experiment)
+    db.refresh(revision)
+    return {
+        "ok": True,
+        "experiment": _serialize_experiment(experiment),
+        "revision": _serialize_revision(revision),
+    }
+
+
+@app.post("/experiments/{experiment_key}/pause")
+def pause_experiment(
+    experiment_key: str,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_roles(ROLE_EXPERIMENT_WRITE)),
+    ab_service: ABFlagService = Depends(get_ab_service),
+):
+    experiment = db.query(Experiment).filter(Experiment.key == experiment_key).first()
+    if not experiment:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    if experiment.status == EXPERIMENT_STATUS_PAUSED:
+        return {"ok": True, "experiment": _serialize_experiment(experiment)}
+    if experiment.status != EXPERIMENT_STATUS_RUNNING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot pause experiment in status '{experiment.status}'",
+        )
+
+    experiment.status = EXPERIMENT_STATUS_PAUSED
+    experiment.updated_at = datetime.now(timezone.utc)
+
+    try:
+        db.flush()
+        ab_service.pause_experiment(experiment.key)
+    except ABFlagServiceError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to pause experiment: {exc}",
+        )
+
+    db.commit()
+    db.refresh(experiment)
+    return {"ok": True, "experiment": _serialize_experiment(experiment)}
+
+
+@app.post("/experiments/{experiment_key}/resume")
+def resume_experiment(
+    experiment_key: str,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_roles(ROLE_EXPERIMENT_WRITE)),
+    ab_service: ABFlagService = Depends(get_ab_service),
+):
+    experiment = db.query(Experiment).filter(Experiment.key == experiment_key).first()
+    if not experiment:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    if experiment.status == EXPERIMENT_STATUS_RUNNING:
+        return {"ok": True, "experiment": _serialize_experiment(experiment)}
+    if experiment.status != EXPERIMENT_STATUS_PAUSED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot resume experiment in status '{experiment.status}'",
+        )
+    if experiment.rollout_percentage <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Cannot resume an experiment with zero rollout percentage",
+        )
+
+    variant_weights = {variant.name: float(variant.weight or 0.0) for variant in experiment.variants}
+    if not variant_weights:
+        raise HTTPException(status_code=422, detail="Experiment has no variants configured")
+    if not isclose(sum(variant_weights.values()), 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Experiment variants must be normalized before resuming",
+        )
+
+    experiment.status = EXPERIMENT_STATUS_RUNNING
+    experiment.updated_at = datetime.now(timezone.utc)
+
+    try:
+        db.flush()
+        ab_service.resume_experiment(
+            experiment.key,
+            float(experiment.rollout_percentage),
+            variant_weights,
+        )
+    except ABFlagServiceError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to resume experiment: {exc}",
+        )
+
+    db.commit()
+    db.refresh(experiment)
+    return {"ok": True, "experiment": _serialize_experiment(experiment)}
 
 # ----- Tips -----
 @app.get("/clients/{client_id}/tips/today")
