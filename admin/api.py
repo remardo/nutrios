@@ -4,13 +4,25 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, date, timezone
 from .db import SessionLocal, init_db, ensure_meals_extras_column
-from .models import Base, Client, Meal, ClientTargets
+from .models import Base, Client, Meal, ClientTargets, ChallengeDefinition, ClientChallenge, DailyHabitLog
 from .auth import require_api_key
 from .analysis import df_meals, summary_macros, summary_extras, micro_top
 from dotenv import load_dotenv
 from pathlib import Path
+from .challenges import (
+    ensure_default_definitions,
+    recalc_daily_log_from_meals,
+    update_daily_log_manual,
+    list_available_challenges,
+    active_challenges_with_progress,
+    assign_challenge,
+    refresh_all_active,
+    recalculate_challenge_progress,
+    serialize_challenge,
+    manual_factor_from_payload,
+)
 
 app = FastAPI(title="Nutrios Admin API")
 
@@ -18,6 +30,13 @@ def get_db():
     db = SessionLocal()
     try: yield db
     finally: db.close()
+
+
+def parse_iso_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD")
 
 # init
 # Load .env from project root to ensure env vars like ALLOW_DEBUG_WEBAPP are available
@@ -30,6 +49,12 @@ except Exception:
     pass
 init_db(Base)
 ensure_meals_extras_column()
+# Ensure default challenge definitions exist
+try:
+    db = SessionLocal()
+    ensure_default_definitions(db)
+finally:
+    db.close()
 # mount mini app static
 app.mount("/miniapp", StaticFiles(directory="miniapp", html=True), name="miniapp")
 
@@ -53,6 +78,23 @@ class IngestMeal(BaseModel):
     image_path: Optional[str] = None
     message_id: int
 
+
+class HabitLogPayload(BaseModel):
+    water_ml: Optional[int] = None
+    steps: Optional[int] = None
+    vegetables_g: Optional[int] = None
+    had_sweets: Optional[bool] = None
+
+
+class ChallengeAssignPayload(BaseModel):
+    code: str
+    start_date: Optional[date] = None
+    difficulty_factor: Optional[float] = None
+
+
+class ChallengeProgressPayload(BaseModel):
+    refresh: Optional[bool] = True
+
 # ----- Ingest -----
 @app.post("/ingest/meal")
 def ingest_meal_api(payload: IngestMeal, db: Session = Depends(get_db), _=Depends(require_api_key)):
@@ -64,6 +106,8 @@ def ingest_meal_api(payload: IngestMeal, db: Session = Depends(get_db), _=Depend
     meal = db.query(Meal).filter_by(client_id=client.id, message_id=payload.message_id).first()
     fields = payload.dict()
     captured_at = datetime.fromisoformat(fields.pop("captured_at_iso"))
+    if captured_at.tzinfo is not None:
+        captured_at = captured_at.astimezone(timezone.utc).replace(tzinfo=None)
     fields.pop("message_id", None)  # Remove message_id to avoid duplicate
     fields.pop("telegram_user_id", None)  # Remove client fields
     fields.pop("telegram_username", None)
@@ -74,6 +118,20 @@ def ingest_meal_api(payload: IngestMeal, db: Session = Depends(get_db), _=Depend
         for k, v in fields.items():
             setattr(meal, k, v)
         meal.captured_at = captured_at
+    db.flush()
+
+    # Recalculate habit aggregates for the meal day
+    try:
+        recalc_daily_log_from_meals(db, client.id, captured_at.date())
+    except Exception:
+        pass
+
+    # Refresh challenge progress after meal update
+    try:
+        refresh_all_active(db, client.id)
+    except Exception:
+        pass
+
     db.commit()
     return {"ok": True, "meal_id": meal.id, "client_id": client.id}
 
@@ -133,6 +191,76 @@ def list_meals(client_id: int, db: Session = Depends(get_db)):
         "extras": r.extras,
         "image_path": r.image_path, "source_type": r.source_type, "message_id": r.message_id
     } for r in rows]
+
+
+def _habit_to_dict(log: DailyHabitLog | None, day: date) -> dict:
+    if not log:
+        return {
+            "date": day.isoformat(),
+            "water_ml": 0,
+            "steps": 0,
+            "vegetables_g": 0,
+            "had_sweets": False,
+            "logged_meals": 0,
+            "total_kcal": 0,
+            "protein_g": 0,
+            "fat_g": 0,
+            "carbs_g": 0,
+            "extras": {},
+        }
+    return {
+        "date": log.date.isoformat(),
+        "water_ml": log.water_ml or 0,
+        "steps": log.steps or 0,
+        "vegetables_g": log.vegetables_g or 0,
+        "had_sweets": bool(log.had_sweets),
+        "logged_meals": log.logged_meals or 0,
+        "total_kcal": log.total_kcal or 0,
+        "protein_g": log.protein_g or 0,
+        "fat_g": log.fat_g or 0,
+        "carbs_g": log.carbs_g or 0,
+        "extras": log.extras or {},
+    }
+
+
+@app.get("/clients/{client_id}/habits/{day}")
+def get_habit_log(client_id: int, day: str, db: Session = Depends(get_db)):
+    target_date = parse_iso_date(day)
+    client = db.query(Client).filter_by(id=client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    try:
+        log = recalc_daily_log_from_meals(db, client_id, target_date)
+        db.flush()
+        db.commit()
+    except Exception:
+        db.rollback()
+        log = db.query(DailyHabitLog).filter_by(client_id=client_id, date=target_date).first()
+    return _habit_to_dict(log, target_date)
+
+
+@app.put("/clients/{client_id}/habits/{day}")
+def put_habit_log(client_id: int, day: str, payload: HabitLogPayload, db: Session = Depends(get_db)):
+    target_date = parse_iso_date(day)
+    client = db.query(Client).filter_by(id=client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    log = update_daily_log_manual(
+        db,
+        client_id,
+        target_date,
+        water_ml=payload.water_ml,
+        steps=payload.steps,
+        vegetables_g=payload.vegetables_g,
+        had_sweets=payload.had_sweets,
+    )
+    db.flush()
+    try:
+        refresh_all_active(db, client_id)
+    except Exception:
+        pass
+    db.commit()
+    return _habit_to_dict(log, target_date)
 
 
 # ----- Targets / Questionnaire / Progress -----
@@ -295,6 +423,53 @@ def weekly_progress(client_id: int, db: Session = Depends(get_db)):
     agg = summary_macros(df, freq="W")
     targets = get_targets(client_id, db)
     return _progress_rows(agg, targets)
+
+
+@app.get("/clients/{client_id}/challenges/available")
+def available_challenges(client_id: int, db: Session = Depends(get_db)):
+    client = db.query(Client).filter_by(id=client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return list_available_challenges(db, client)
+
+
+@app.get("/clients/{client_id}/challenges/active")
+def active_challenges(client_id: int, db: Session = Depends(get_db)):
+    client = db.query(Client).filter_by(id=client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return active_challenges_with_progress(db, client)
+
+
+@app.post("/clients/{client_id}/challenges")
+def post_challenge(client_id: int, payload: ChallengeAssignPayload, db: Session = Depends(get_db)):
+    client = db.query(Client).filter_by(id=client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    definition = db.query(ChallengeDefinition).filter_by(code=payload.code).first()
+    if not definition:
+        raise HTTPException(status_code=404, detail="Challenge definition not found")
+    challenge = assign_challenge(db, client, definition, start=payload.start_date, factor=manual_factor_from_payload(payload.model_dump()))
+    progress = recalculate_challenge_progress(db, challenge)
+    db.commit()
+    return serialize_challenge(challenge, progress)
+
+
+@app.post("/clients/{client_id}/challenges/{challenge_id}/progress")
+def post_challenge_progress(client_id: int, challenge_id: int, payload: ChallengeProgressPayload, db: Session = Depends(get_db)):
+    challenge = (
+        db.query(ClientChallenge)
+        .filter(ClientChallenge.id == challenge_id, ClientChallenge.client_id == client_id)
+        .first()
+    )
+    if not challenge:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    progress = recalculate_challenge_progress(db, challenge)
+    if payload.refresh:
+        db.commit()
+    else:
+        db.flush()
+    return serialize_challenge(challenge, progress)
 
 
 @app.get("/clients/{client_id}/streak")

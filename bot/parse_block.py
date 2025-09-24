@@ -14,7 +14,7 @@ def parse_formatted_block(block: str) -> Dict[str, Any]:
         "protein_g": None, "fat_g": None, "carbs_g": None,
         "flags": {"vegetarian": None, "vegan": None, "glutenfree": None, "lactosefree": None},
         "micronutrients": [], "assumptions": [],
-        "extras": {"fats": {}, "fiber": {}}
+        "extras": {"fats": {}, "fiber": {}, "vegetables_g": 0, "water_ml": 0, "is_sweet": False, "had_sweets": False}
     }
     # title — вторая строка
     m = re.search(r"\n([^\n]+)\.\nПорция", block)
@@ -80,6 +80,27 @@ def parse_formatted_block(block: str) -> Dict[str, Any]:
             pass
     if fiber:
         data["extras"]["fiber"] = fiber
+
+    # Овощи / сладкое / вода
+    m = re.search(r"Овощи:\s*([\d.,]+)\s*г", block, re.IGNORECASE)
+    if m:
+        try:
+            data["extras"]["vegetables_g"] = int(float(m.group(1).replace(",", ".")))
+        except Exception:
+            pass
+
+    m = re.search(r"Сладкое:\s*(да|нет)", block, re.IGNORECASE)
+    if m:
+        sweet = (m.group(1).strip().lower() == "да")
+        data["extras"]["is_sweet"] = sweet
+        data["extras"]["had_sweets"] = sweet
+
+    m = re.search(r"Вода/напитки:\s*([\d.,]+)\s*мл", block, re.IGNORECASE)
+    if m:
+        try:
+            data["extras"]["water_ml"] = int(float(m.group(1).replace(",", ".")))
+        except Exception:
+            pass
 
     # Флаги диеты
     m = re.search(r"vegetarian:\s*(да|нет).*vegan:\s*(да|нет)", block)

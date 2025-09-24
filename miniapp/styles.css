@@ -28,5 +28,10 @@ input, select { background: #0f141f; color: var(--text); border: 1px solid #2430
 .streak { font-size: 18px; }
 .ok { color: var(--ok); }
 .warn { color: var(--warn); }
+.muted { color: var(--muted); font-size: 13px; }
+.challenge-list { display: grid; gap: 8px; }
+.challenge-item { background: #0f141f; border: 1px solid #1f2638; border-radius: 10px; padding: 10px 12px; }
+.challenge-item .title { font-weight: 600; margin-bottom: 4px; }
+.challenge-item .meta { color: var(--muted); font-size: 12px; }
 footer { height: 60px; display: grid; place-items: center; }
 

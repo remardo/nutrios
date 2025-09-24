@@ -113,6 +113,9 @@ FORMAT_INSTRUCTIONS_RU = """
 Жиры подробно: всего {F_TOTAL} г; насыщенные {F_SAT} г; мононенасыщенные {F_MONO} г; полиненасыщенные {F_POLY} г; транс {F_TRANS} г
 Омега: омега-6 {OMEGA6} г; омега-3 {OMEGA3} г (соотношение {OMEGA_RATIO})
 Клетчатка: всего {FIBER_TOTAL} г (растворимая {FIBER_SOL} г, нерастворимая {FIBER_INSOL} г)
+Овощи: {VEGETABLES} г
+Сладкое: {SWEET_FLAG}
+Вода/напитки: {WATER_ML} мл
 Ключевые микроэлементы (топ-5):
 • {MICRO1}
 • {MICRO2}
@@ -126,6 +129,8 @@ FORMAT_INSTRUCTIONS_RU = """
 Правила:
 - Сохраняй точный макет и порядок строк.
 - Если чего-то нет, поставь реалистичную оценку, не оставляй пусто (например, «Калории: 360 ккал»).
+- Строка «Сладкое» должна быть только «да» или «нет» (наличие десертов/сладостей).
+- Если нет овощей или воды, ставь «0 г» / «0 мл» соответственно.
 - Название блюда {TITLE} — короткое и точное (например: «Жареный лосось с картофелем и салатом»).
 - Не добавляй ничего вне блока.
 """
@@ -225,15 +230,27 @@ async def ensure_fat_fiber_sections(block: str) -> str:
     needs_fats = ("Жиры подробно:" not in block)
     needs_omega = ("Омега:" not in block)
     needs_fiber = ("Клетчатка:" not in block)
-    if not (needs_fats or needs_omega or needs_fiber):
+    needs_vegetables = ("Овощи:" not in block)
+    needs_sweets = ("Сладкое:" not in block)
+    needs_water = ("Вода/напитки:" not in block)
+    if not (needs_fats or needs_omega or needs_fiber or needs_vegetables or needs_sweets or needs_water):
         return block
     try:
         missing_list = ", ".join([
-            s for s, cond in [("жиры подробно", needs_fats),("омега", needs_omega),("клетчатка", needs_fiber)] if cond
+            s
+            for s, cond in [
+                ("жиры подробно", needs_fats),
+                ("омега", needs_omega),
+                ("клетчатка", needs_fiber),
+                ("овощи", needs_vegetables),
+                ("сладкое", needs_sweets),
+                ("вода", needs_water),
+            ]
+            if cond
         ])
         revise_system = (
-            "Ты редактор. Вставь в переданный блок отсутствующие строки для 'Жиры подробно', 'Омега' и 'Клетчатка' в соответствии с заданным форматом. "
-            "Сохрани весь остальной текст без изменений. Если точных данных нет — поставь реалистичные оценки и единицы (г). "
+            "Ты редактор. Вставь в переданный блок отсутствующие строки для 'Жиры подробно', 'Омега', 'Клетчатка', 'Овощи', 'Сладкое' и 'Вода/напитки' в соответствии с заданным форматом. "
+            "Сохрани весь остальной текст без изменений. Если точных данных нет — поставь реалистичные оценки и единицы (г/мл). "
             "Строго верни только обновлённый блок без комментариев."
         )
         user_req = f"Отсутствуют: {missing_list}. Добавь соответствующие строки ровно в те места формата после БЖУ."
@@ -435,6 +452,52 @@ async def week_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await _build_weekly_text(update.effective_user.id)
     await update.message.reply_text(text)
 
+async def challenge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    client_id = await _fetch_client_id(user_id)
+    if not client_id:
+        await update.message.reply_text("Сначала распознайте хотя бы одно блюдо — профиль ещё не создан.")
+        return
+    active = await _fetch_active_challenges(client_id)
+    available = await _fetch_available_challenges(client_id)
+    lines: list[str] = []
+    if active:
+        lines.append("🔥 Активные челленджи:")
+        for row in active:
+            lines.append(_fmt_challenge_line(row))
+    else:
+        lines.append("Пока нет активных челленджей.")
+    suggestions = [row for row in available if not row.get("already_active")]
+    if suggestions:
+        opt = suggestions[0]
+        meta = opt.get("meta") or {}
+        unit = meta.get("unit") or ""
+        target = opt.get("suggested_target") or opt.get("target_value")
+        try:
+            target_str = str(int(round(float(target))))
+        except Exception:
+            target_str = str(target)
+        unit_text = f" {unit}" if unit else ""
+        lines.append("")
+        lines.append(f"Следующий уровень: {opt.get('name', opt.get('code'))} — цель {target_str}{unit_text}.")
+    await update.message.reply_text("\n".join(lines))
+
+async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    client_id = await _fetch_client_id(user_id)
+    if not client_id:
+        await update.message.reply_text("Прогресс недоступен — нет данных по пользователю.")
+        return
+    active = await _fetch_active_challenges(client_id)
+    if not active:
+        await update.message.reply_text("Активных челленджей пока нет. Используйте /challenge, чтобы получить предложение.")
+        return
+    parts: list[str] = ["📈 Прогресс челленджей:"]
+    for row in active:
+        parts.append(_fmt_challenge_details(row))
+        parts.append("")
+    await update.message.reply_text("\n".join(parts).strip())
+
 async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         d = update.to_dict(); keys = list(d.keys())
@@ -454,6 +517,28 @@ async def _fetch_client_id(telegram_user_id: int) -> int | None:
     except Exception:
         return None
     return None
+
+async def _fetch_active_challenges(client_id: int) -> list[dict]:
+    base = os.getenv('ADMIN_API_BASE', 'http://localhost:8000')
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client_http:
+            r = await client_http.get(f"{base}/clients/{client_id}/challenges/active")
+            if r.status_code != 200:
+                return []
+            return r.json() or []
+    except Exception:
+        return []
+
+async def _fetch_available_challenges(client_id: int) -> list[dict]:
+    base = os.getenv('ADMIN_API_BASE', 'http://localhost:8000')
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client_http:
+            r = await client_http.get(f"{base}/clients/{client_id}/challenges/available")
+            if r.status_code != 200:
+                return []
+            return r.json() or []
+    except Exception:
+        return []
 
 async def _fetch_summary(client_id: int, kind: str):
     base = os.getenv('ADMIN_API_BASE', 'http://localhost:8000')
@@ -475,6 +560,40 @@ def _fmt_macros(kcal, p, f, c):
         except Exception:
             return 0
     return f"Калории: {_n(kcal)} ккал\nБелки: {_n(p)} г · Жиры: {_n(f)} г · Углеводы: {_n(c)} г"
+
+def _fmt_challenge_line(row: dict) -> str:
+    progress = row.get("progress") or {}
+    meta = progress.get("meta") or row.get("meta") or {}
+    unit = meta.get("unit") or ""
+    def _num(v):
+        try:
+            return int(round(float(v)))
+        except Exception:
+            return 0
+    value = _num(progress.get("value"))
+    target = _num(progress.get("target_value") or row.get("target_value"))
+    unit_text = f" {unit}" if unit else ""
+    status = row.get("status") or ("completed" if progress.get("completed") else "active")
+    icon = "✅" if progress.get("completed") or status == "completed" else ("🔥" if status == "active" else "⏳")
+    name = row.get("name") or row.get("code") or "Челлендж"
+    return f"{icon} {name}: {value}/{target}{unit_text} ({status})"
+
+def _fmt_challenge_details(row: dict) -> str:
+    line = _fmt_challenge_line(row)
+    period = f"Период: {row.get('start_date')} – {row.get('end_date')}"
+    baseline = row.get("baseline_value")
+    meta = row.get("meta") or {}
+    unit = (row.get("progress") or {}).get("meta", {}).get("unit") or meta.get("unit") or ""
+    def _num(v):
+        try:
+            return int(round(float(v)))
+        except Exception:
+            return 0
+    target = _num(row.get("target_value"))
+    base = _num(baseline)
+    baseline_txt = f"Базовый уровень: {base}{(' ' + unit) if unit else ''}"
+    target_txt = f"Цель: {target}{(' ' + unit) if unit else ''}"
+    return "\n".join([line, baseline_txt, target_txt, period])
 
 async def _build_daily_text(telegram_user_id: int) -> str:
     client_id = await _fetch_client_id(telegram_user_id)
@@ -680,6 +799,8 @@ def main():
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("week", week_command))
+    app.add_handler(CommandHandler("challenge", challenge_command))
+    app.add_handler(CommandHandler("progress", progress_command))
     app.add_handler(MessageHandler(filters.ALL, debug_all, block=False), group=100)
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_correction))
