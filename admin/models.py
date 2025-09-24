@@ -2,7 +2,6 @@ from sqlalchemy import Column, Integer, Float, String, Boolean, ForeignKey, Date
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 from .db import Base
-from sqlalchemy import UniqueConstraint
 
 class Client(Base):
     __tablename__ = "clients"
@@ -52,3 +51,64 @@ class ClientTargets(Base):
     notifications = Column(JSON, nullable=True) # preferences: {reminders:true, time:"08:00", tips:true}
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class Experiment(Base):
+    __tablename__ = "experiments"
+
+    id = Column(Integer, primary_key=True)
+    key = Column(String, unique=True, nullable=False, index=True)
+    description = Column(String, nullable=True)
+    rollout_percentage = Column(Float, default=0.0)
+    status = Column(String, default="draft", nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    variants = relationship(
+        "ExperimentVariant",
+        back_populates="experiment",
+        cascade="all, delete-orphan",
+        order_by="ExperimentVariant.id",
+    )
+    revisions = relationship(
+        "ExperimentRevision",
+        back_populates="experiment",
+        cascade="all, delete-orphan",
+        order_by="ExperimentRevision.revision",
+    )
+
+
+class ExperimentVariant(Base):
+    __tablename__ = "experiment_variants"
+
+    id = Column(Integer, primary_key=True)
+    experiment_id = Column(Integer, ForeignKey("experiments.id"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    weight = Column(Float, default=0.0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    experiment = relationship("Experiment", back_populates="variants")
+
+    __table_args__ = (
+        UniqueConstraint("experiment_id", "name", name="uq_variant_name_per_experiment"),
+    )
+
+
+class ExperimentRevision(Base):
+    __tablename__ = "experiment_revisions"
+
+    id = Column(Integer, primary_key=True)
+    experiment_id = Column(Integer, ForeignKey("experiments.id"), nullable=False, index=True)
+    revision = Column(Integer, nullable=False)
+    rollout_percentage = Column(Float, nullable=False)
+    variant_weights = Column(JSON, nullable=False)
+    status = Column(String, nullable=False, default="draft")
+    published_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    experiment = relationship("Experiment", back_populates="revisions")
+
+    __table_args__ = (
+        UniqueConstraint("experiment_id", "revision", name="uq_experiment_revision"),
+    )
