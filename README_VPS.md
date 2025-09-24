@@ -118,6 +118,68 @@ screen -r bot
 screen -r dashboard
 ```
 
+## Manual Daily Metrics & Events Logging
+
+До полноценной автоматизации нутрициолог может фиксировать ежедневные отметки и события вручную через REST API админки.
+
+### Ежедневные метрики
+
+Эндпоинт: `PUT /clients/{client_id}/metrics/daily`
+
+Тело запроса — объект (или список объектов) с датой и нужными полями. Идемпотентность обеспечивается сочетанием `(client_id, date)`.
+
+```bash
+curl -X PUT \
+  -H "x-api-key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  "${ADMIN_API_BASE}/clients/42/metrics/daily" \
+  -d '{
+        "date": "2024-06-15",
+        "water_goal_met": true,
+        "steps": 8700,
+        "dinner_logged": true,
+        "new_recipe_logged": false,
+        "protein_goal_met": true,
+        "fiber_goal_met": false
+      }'
+```
+
+Доступные поля:
+
+- `water_goal_met` — достигнута ли цель по воде за день.
+- `steps` — количество шагов (целое число).
+- `protein_goal_met`, `fiber_goal_met` — выполнены ли цели по белку/клетчатке.
+- `breakfast_logged_before_10` — был ли завтрак до 10:00.
+- `dinner_logged` — ужин зафиксирован.
+- `new_recipe_logged` — пробовали новое блюдо.
+
+Любые отсутствующие поля не изменяют текущее состояние. Можно отправлять несколько объектов одним запросом.
+
+### События клиента
+
+Эндпоинт: `POST /clients/{client_id}/events`
+
+Эндпоинт принимает объект (или список), идемпотентность по сочетанию `(client_id, date, type)`. Если событие уже есть за этот день, оно обновится.
+
+```bash
+curl -X POST \
+  -H "x-api-key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  "${ADMIN_API_BASE}/clients/42/events" \
+  -d '{
+        "type": "challenge_completed",
+        "date": "2024-06-15",
+        "payload": {"title": "10к шагов ежедневно"}
+      }'
+```
+
+Поддерживаемые типы событий: `portion_adjusted`, `shared_progress`, `challenge_completed`, `streak_resumed` (можно расширять по необходимости). Поле `payload` — произвольный JSON с деталями события.
+
+### Быстрые отметки
+
+- В боте доступны команды `/water`, `/steps <число>`, `/dinner`, `/newrecipe` — они обновляют текущие метрики.
+- В мини-приложении появился блок «Ежедневные отметки» (вода, шаги, ужин, новый рецепт) и секция «Челленджи и события» для фиксации прогресса, завершённых челленджей, восстановления серии и шеринга.
+
 ## Nginx Configuration
 
 ### Install and Configure

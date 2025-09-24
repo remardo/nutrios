@@ -34,6 +34,30 @@
       </section>
 
       <section class="card">
+        <div class="section-title">Ежедневные отметки</div>
+        <div id="dailyMetricsStatus" class="metrics-status muted">Нет данных за сегодня</div>
+        <div class="actions-grid">
+          <button id="markWater" class="btn btn-secondary">💧 Вода выполнена</button>
+          <form id="stepsForm" class="inline-form">
+            <input type="number" id="stepsInput" min="0" placeholder="Шаги" />
+            <button type="submit" class="btn">Сохранить шаги</button>
+          </form>
+          <button id="markDinner" class="btn btn-secondary">🍽️ Ужин отмечен</button>
+          <button id="markNewRecipe" class="btn btn-secondary">🆕 Новый рецепт</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-title">Челленджи и события</div>
+        <div class="actions-vertical">
+          <button id="btnChallenge" class="btn btn-secondary">🏁 Челлендж выполнен</button>
+          <button id="btnShareProgress" class="btn btn-secondary">📣 Поделиться прогрессом</button>
+          <button id="btnStreakResumed" class="btn btn-secondary">🔥 Серия возобновлена</button>
+        </div>
+        <div id="eventsList" class="events-list muted"></div>
+      </section>
+
+      <section class="card">
         <div class="section-title">Опросник (цели и состояние)</div>
         <form id="quiz" class="form-grid">
           <label>Возраст<input type="number" name="age" min="10" max="100" /></label>

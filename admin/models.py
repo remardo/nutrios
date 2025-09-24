@@ -1,8 +1,18 @@
-from sqlalchemy import Column, Integer, Float, String, Boolean, ForeignKey, DateTime, JSON, UniqueConstraint
+from sqlalchemy import (
+    Column,
+    Integer,
+    Float,
+    String,
+    Boolean,
+    ForeignKey,
+    DateTime,
+    JSON,
+    UniqueConstraint,
+    Date,
+)
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 from .db import Base
-from sqlalchemy import UniqueConstraint
 
 class Client(Base):
     __tablename__ = "clients"
@@ -11,6 +21,12 @@ class Client(Base):
     telegram_username = Column(String, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     meals = relationship("Meal", back_populates="client")
+    daily_metrics = relationship(
+        "ClientDailyMetrics", back_populates="client", cascade="all, delete-orphan"
+    )
+    events = relationship(
+        "ClientEvents", back_populates="client", cascade="all, delete-orphan"
+    )
 
 class Meal(Base):
     __tablename__ = "meals"
@@ -52,3 +68,51 @@ class ClientTargets(Base):
     notifications = Column(JSON, nullable=True) # preferences: {reminders:true, time:"08:00", tips:true}
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class ClientDailyMetrics(Base):
+    __tablename__ = "client_daily_metrics"
+
+    id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), index=True, nullable=False)
+    date = Column(Date, nullable=False, index=True)
+    water_goal_met = Column(Boolean, default=False)
+    steps = Column(Integer, nullable=True)
+    protein_goal_met = Column(Boolean, default=False)
+    fiber_goal_met = Column(Boolean, default=False)
+    breakfast_logged_before_10 = Column(Boolean, default=False)
+    dinner_logged = Column(Boolean, default=False)
+    new_recipe_logged = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    client = relationship("Client", back_populates="daily_metrics")
+    __table_args__ = (
+        UniqueConstraint("client_id", "date", name="uq_client_daily_metrics"),
+    )
+
+
+class ClientEvents(Base):
+    __tablename__ = "client_events"
+
+    id = Column(Integer, primary_key=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), index=True, nullable=False)
+    occurred_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    occurred_on = Column(Date, default=lambda: datetime.now(timezone.utc).date(), nullable=False, index=True)
+    type = Column(String, nullable=False, index=True)
+    payload = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    client = relationship("Client", back_populates="events")
+    __table_args__ = (
+        UniqueConstraint("client_id", "occurred_on", "type", name="uq_client_event_per_day"),
+    )

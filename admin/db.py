@@ -1,6 +1,6 @@
 import os
 import logging
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 DB_URL = os.getenv("ADMIN_DB_URL", "sqlite:///./nutrios.db")
@@ -10,6 +10,18 @@ Base = declarative_base()
 
 def init_db(BaseModel):
     BaseModel.metadata.create_all(bind=engine)
+
+
+def ensure_metrics_tables(BaseModel):
+    """Ensure auxiliary tables for client metrics/events exist (backward compatible init)."""
+    try:
+        inspector = inspect(engine)
+        existing = set(inspector.get_table_names())
+        for table_name in ("client_daily_metrics", "client_events"):
+            if table_name in BaseModel.metadata.tables and table_name not in existing:
+                BaseModel.metadata.tables[table_name].create(bind=engine, checkfirst=True)
+    except Exception as e:
+        logging.getLogger(__name__).warning("ensure_metrics_tables failed: %s", e)
 
 def ensure_meals_extras_column():
     """Ensure 'extras' column exists in 'meals' (SQLite-compatible)."""

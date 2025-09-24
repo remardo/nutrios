@@ -1,12 +1,12 @@
 import os, hmac, hashlib, json
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from datetime import datetime
-from .db import SessionLocal, init_db, ensure_meals_extras_column
-from .models import Base, Client, Meal, ClientTargets
+from datetime import datetime, date, time, timezone
+from .db import SessionLocal, init_db, ensure_meals_extras_column, ensure_metrics_tables
+from .models import Base, Client, Meal, ClientTargets, ClientDailyMetrics, ClientEvents
 from .auth import require_api_key
 from .analysis import df_meals, summary_macros, summary_extras, micro_top
 from dotenv import load_dotenv
@@ -29,6 +29,7 @@ try:
 except Exception:
     pass
 init_db(Base)
+ensure_metrics_tables(Base)
 ensure_meals_extras_column()
 # mount mini app static
 app.mount("/miniapp", StaticFiles(directory="miniapp", html=True), name="miniapp")
@@ -52,6 +53,130 @@ class IngestMeal(BaseModel):
     source_type: str
     image_path: Optional[str] = None
     message_id: int
+
+
+# ----- Metrics & Events Schemas -----
+class DailyMetricIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date: date
+    water_goal_met: Optional[bool] = None
+    steps: Optional[int] = Field(default=None, ge=0)
+    protein_goal_met: Optional[bool] = None
+    fiber_goal_met: Optional[bool] = None
+    breakfast_logged_before_10: Optional[bool] = None
+    dinner_logged: Optional[bool] = None
+    new_recipe_logged: Optional[bool] = None
+
+
+class ClientEventIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: str
+    occurred_at: Optional[datetime] = None
+    date: Optional[date] = None
+    payload: Optional[dict] = None
+
+    @field_validator("type")
+    @classmethod
+    def _validate_type(cls, v: str) -> str:
+        t = (v or "").strip().lower()
+        if not t:
+            raise ValueError("type is required")
+        allowed = set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+        if any(ch not in allowed for ch in t):
+            raise ValueError("type must contain lowercase letters, digits, '_' or '-'")
+        return t
+
+    @field_validator("payload")
+    @classmethod
+    def _validate_payload(cls, v):
+        if v is not None and not isinstance(v, dict):
+            raise ValueError("payload must be a JSON object")
+        return v
+
+
+def _client_or_404(db: Session, client_id: int) -> Client:
+    client = db.query(Client).filter_by(id=client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return client
+
+
+def _telegram_auth_ok(raw: str | None, expected_user_id: Optional[int]) -> bool:
+    if not raw or not expected_user_id:
+        return False
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not bot_token:
+        return False
+    try:
+        parts = dict(item.split('=', 1) for item in raw.split('&') if '=' in item)
+        data_json = parts.get('user')
+        hash_recv = parts.get('hash')
+        if not data_json or not hash_recv:
+            return False
+        secret = hashlib.sha256(bot_token.encode()).digest()
+        check_string = '\n'.join(sorted([f"{k}={v}" for k, v in parts.items() if k != 'hash']))
+        h = hmac.new(secret, msg=check_string.encode(), digestmod=hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(h, hash_recv):
+            return False
+        user = json.loads(data_json) if data_json else {}
+        uid = int(user.get('id')) if user and 'id' in user else None
+        return uid == expected_user_id
+    except Exception:
+        return False
+
+
+def _authorize_client_write(
+    client: Client,
+    x_api_key: Optional[str],
+    init_data: Optional[str],
+    request: Optional[Request],
+):
+    expected_key = os.getenv("ADMIN_API_KEY", "supersecret")
+    if x_api_key and hmac.compare_digest(x_api_key, expected_key):
+        return
+    if init_data and _telegram_auth_ok(init_data, client.telegram_user_id):
+        return
+    allow_debug = os.getenv("ALLOW_DEBUG_WEBAPP", "0").lower() in {"1", "true", "yes"}
+    if allow_debug and request is not None:
+        try:
+            tg = request.query_params.get("tg") if hasattr(request, "query_params") else None
+            if tg and client.telegram_user_id and int(tg) == client.telegram_user_id:
+                return
+        except Exception:
+            pass
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _serialize_daily_metric(row: ClientDailyMetrics) -> dict:
+    return {
+        "id": row.id,
+        "client_id": row.client_id,
+        "date": row.date.isoformat() if row.date else None,
+        "water_goal_met": bool(row.water_goal_met) if row.water_goal_met is not None else None,
+        "steps": row.steps,
+        "protein_goal_met": bool(row.protein_goal_met) if row.protein_goal_met is not None else None,
+        "fiber_goal_met": bool(row.fiber_goal_met) if row.fiber_goal_met is not None else None,
+        "breakfast_logged_before_10": bool(row.breakfast_logged_before_10) if row.breakfast_logged_before_10 is not None else None,
+        "dinner_logged": bool(row.dinner_logged) if row.dinner_logged is not None else None,
+        "new_recipe_logged": bool(row.new_recipe_logged) if row.new_recipe_logged is not None else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _serialize_event(row: ClientEvents) -> dict:
+    return {
+        "id": row.id,
+        "client_id": row.client_id,
+        "occurred_at": row.occurred_at.isoformat() if row.occurred_at else None,
+        "occurred_on": row.occurred_on.isoformat() if row.occurred_on else None,
+        "type": row.type,
+        "payload": row.payload,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
 
 # ----- Ingest -----
 @app.post("/ingest/meal")
@@ -133,6 +258,164 @@ def list_meals(client_id: int, db: Session = Depends(get_db)):
         "extras": r.extras,
         "image_path": r.image_path, "source_type": r.source_type, "message_id": r.message_id
     } for r in rows]
+
+
+# ----- Daily Metrics -----
+@app.get("/clients/{client_id}/metrics/daily")
+def get_daily_metrics(
+    client_id: int,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    limit: int = 30,
+    db: Session = Depends(get_db),
+):
+    _ = _client_or_404(db, client_id)
+    q = db.query(ClientDailyMetrics).filter(ClientDailyMetrics.client_id == client_id)
+    if start_date:
+        q = q.filter(ClientDailyMetrics.date >= start_date)
+    if end_date:
+        q = q.filter(ClientDailyMetrics.date <= end_date)
+    q = q.order_by(ClientDailyMetrics.date.desc())
+    if limit:
+        limit = max(1, min(int(limit), 365))
+        q = q.limit(limit)
+    rows = q.all()
+    return [_serialize_daily_metric(r) for r in rows]
+
+
+@app.put("/clients/{client_id}/metrics/daily")
+def put_daily_metrics(
+    client_id: int,
+    payload: DailyMetricIn | List[DailyMetricIn],
+    db: Session = Depends(get_db),
+    request: Request = None,
+    X_Telegram_Init_Data: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+):
+    client = _client_or_404(db, client_id)
+    _authorize_client_write(client, x_api_key, X_Telegram_Init_Data, request)
+    records = payload if isinstance(payload, list) else [payload]
+    if not records:
+        raise HTTPException(status_code=400, detail="Payload is empty")
+    touched: List[ClientDailyMetrics] = []
+    for item in records:
+        values = item.model_dump(exclude_unset=True)
+        metric_date = values.get("date")
+        if not metric_date:
+            raise HTTPException(status_code=422, detail="date is required")
+        row = (
+            db.query(ClientDailyMetrics)
+            .filter(
+                ClientDailyMetrics.client_id == client.id,
+                ClientDailyMetrics.date == metric_date,
+            )
+            .first()
+        )
+        if not row:
+            row = ClientDailyMetrics(client_id=client.id, date=metric_date)
+            db.add(row)
+        for key, value in values.items():
+            if key == "date":
+                continue
+            setattr(row, key, value)
+        touched.append(row)
+    db.commit()
+    for row in touched:
+        db.refresh(row)
+    return {"ok": True, "items": [_serialize_daily_metric(r) for r in touched]}
+
+
+# ----- Events -----
+@app.get("/clients/{client_id}/events")
+def get_client_events(
+    client_id: int,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    event_type: Optional[str] = None,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    _ = _client_or_404(db, client_id)
+    q = db.query(ClientEvents).filter(ClientEvents.client_id == client_id)
+    if event_type:
+        q = q.filter(ClientEvents.type == event_type.strip().lower())
+    if start_date:
+        q = q.filter(ClientEvents.occurred_on >= start_date)
+    if end_date:
+        q = q.filter(ClientEvents.occurred_on <= end_date)
+    q = q.order_by(ClientEvents.occurred_at.desc())
+    if limit:
+        limit = max(1, min(int(limit), 500))
+        q = q.limit(limit)
+    rows = q.all()
+    return [_serialize_event(r) for r in rows]
+
+
+@app.post("/clients/{client_id}/events")
+def post_client_events(
+    client_id: int,
+    payload: ClientEventIn | List[ClientEventIn],
+    db: Session = Depends(get_db),
+    request: Request = None,
+    X_Telegram_Init_Data: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="x-api-key"),
+):
+    client = _client_or_404(db, client_id)
+    _authorize_client_write(client, x_api_key, X_Telegram_Init_Data, request)
+    records = payload if isinstance(payload, list) else [payload]
+    if not records:
+        raise HTTPException(status_code=400, detail="Payload is empty")
+    now = datetime.now(timezone.utc)
+    created: List[ClientEvents] = []
+    updated: List[ClientEvents] = []
+    for item in records:
+        values = item.model_dump(exclude_unset=True)
+        event_type = values.get("type")
+        if not event_type:
+            raise HTTPException(status_code=422, detail="type is required")
+        occurred_at: datetime | None = values.get("occurred_at")
+        event_date: date | None = values.get("date")
+        if occurred_at and occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+        if occurred_at and event_date and occurred_at.date() != event_date:
+            raise HTTPException(status_code=422, detail="occurred_at and date mismatch")
+        if not event_date:
+            event_date = occurred_at.date() if occurred_at else now.date()
+        if not occurred_at:
+            occurred_at = datetime.combine(event_date, time.min).replace(tzinfo=timezone.utc)
+        payload_data = values.get("payload")
+        row = (
+            db.query(ClientEvents)
+            .filter(
+                ClientEvents.client_id == client.id,
+                ClientEvents.occurred_on == event_date,
+                ClientEvents.type == event_type,
+            )
+            .first()
+        )
+        if row:
+            row.occurred_at = occurred_at
+            if payload_data is not None:
+                row.payload = payload_data
+            updated.append(row)
+        else:
+            row = ClientEvents(
+                client_id=client.id,
+                occurred_at=occurred_at,
+                occurred_on=event_date,
+                type=event_type,
+                payload=payload_data,
+            )
+            db.add(row)
+            created.append(row)
+    db.commit()
+    for row in created + updated:
+        db.refresh(row)
+    return {
+        "ok": True,
+        "created": [_serialize_event(r) for r in created],
+        "updated": [_serialize_event(r) for r in updated],
+    }
 
 
 # ----- Targets / Questionnaire / Progress -----

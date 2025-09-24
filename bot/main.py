@@ -20,7 +20,7 @@
 #   ADMIN_API_BASE=http://localhost:8000
 #   ADMIN_API_KEY=supersecret
 
-import os, json, base64, sqlite3, logging
+import os, json, base64, sqlite3, logging, re
 from datetime import datetime, timezone, date, timedelta
 from typing import Optional
 
@@ -34,7 +34,11 @@ import httpx
 
 # --- Local modules for Admin integration ---
 from parse_block import parse_formatted_block          # bot/parse_block.py
-from ingest_client import ingest_meal                  # bot/ingest_client.py
+from ingest_client import (
+    ingest_meal,
+    upsert_daily_metrics_for_user,
+    post_event_for_user,
+)                  # bot/ingest_client.py
 
 # ------------- ENV / CONFIG -------------
 # Try loading from repo root and bot/ folder
@@ -256,6 +260,67 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Уточнять можно реплаем или отдельным сообщением («есть …», «добавь …», «без …»)."
     )
 
+
+async def water_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    ok = upsert_daily_metrics_for_user(update.effective_user.id, {"water_goal_met": True})
+    if ok:
+        await msg.reply_text("Отмечено: дневная норма воды выполнена ✅")
+    else:
+        await msg.reply_text("Не удалось обновить отметку по воде. Попробуйте чуть позже.")
+
+
+async def steps_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    steps_value: Optional[int] = None
+    if context and getattr(context, "args", None):
+        try:
+            steps_value = int(context.args[0]) if context.args else None
+        except (TypeError, ValueError):
+            steps_value = None
+    if steps_value is None:
+        text = msg.text or ""
+        matches = re.findall(r"\d+", text)
+        if matches:
+            try:
+                steps_value = int(matches[0])
+            except ValueError:
+                steps_value = None
+    if steps_value is None or steps_value < 0:
+        await msg.reply_text("Укажите количество шагов, например: /steps 8500")
+        return
+    ok = upsert_daily_metrics_for_user(update.effective_user.id, {"steps": steps_value})
+    if ok:
+        await msg.reply_text(f"Записано: {steps_value} шагов за сегодня.")
+    else:
+        await msg.reply_text("Не удалось сохранить шаги. Попробуйте позже.")
+
+
+async def dinner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    ok = upsert_daily_metrics_for_user(update.effective_user.id, {"dinner_logged": True})
+    if ok:
+        await msg.reply_text("Ужин отмечен ✅")
+    else:
+        await msg.reply_text("Не удалось отметить ужин. Попробуйте позже.")
+
+
+async def new_recipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    ok = upsert_daily_metrics_for_user(update.effective_user.id, {"new_recipe_logged": True})
+    if ok:
+        await msg.reply_text("Отлично! Новый рецепт добавлен в дневные отметки.")
+    else:
+        await msg.reply_text("Не удалось сохранить отметку. Попробуйте позже.")
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("handle_photo: received update has_photo=%s", bool(update.message and update.message.photo))
     if not update.message or not update.message.photo:
@@ -325,6 +390,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     source_type=mode or "text",
                     image_path=None
                 )
+                try:
+                    post_event_for_user(
+                        update.effective_user.id,
+                        {
+                            "type": "portion_adjusted",
+                            "payload": {
+                                "message_id": bot_msg_id,
+                                "note": text,
+                            },
+                        },
+                    )
+                except Exception:
+                    pass
                 return
 
     # Fresh text identification
@@ -380,6 +458,20 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source_type=mode or "text",
         image_path=None
     )
+    try:
+        user_id = msg.from_user.id if msg.from_user else update.effective_user.id
+        post_event_for_user(
+            user_id,
+            {
+                "type": "portion_adjusted",
+                "payload": {
+                    "message_id": bot_msg_id,
+                    "note": msg.text.strip(),
+                },
+            },
+        )
+    except Exception:
+        pass
 
 async def finalize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Ок — просто ответьте реплаем, если нужно исправить детали. Команда финализации не требуется 😊")
@@ -412,7 +504,8 @@ INSTRUCTION_TEXT = (
     "2. Можно описать блюдо текстом.\n"
     "3. Уточнения: сообщение со словами ‘добавь’, ‘убери’, ‘без’, ‘ещё/еще’, ‘поменяй’, или ответ реплаем на мой блок.\n"
     "4. /menu — показать это меню.\n"
-    "5. Сводки: кнопки ‘За сегодня’, ‘За неделю’ и ‘За сегодня подробно’."
+    "5. Сводки: кнопки ‘За сегодня’, ‘За неделю’ и ‘За сегодня подробно’.\n"
+    "6. Быстрые отметки: /water, /steps <число>, /dinner, /newrecipe."
 )
 
 ABOUT_TEXT = (
@@ -680,6 +773,10 @@ def main():
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("week", week_command))
+    app.add_handler(CommandHandler("water", water_command))
+    app.add_handler(CommandHandler("steps", steps_command))
+    app.add_handler(CommandHandler("dinner", dinner_command))
+    app.add_handler(CommandHandler("newrecipe", new_recipe_command))
     app.add_handler(MessageHandler(filters.ALL, debug_all, block=False), group=100)
     app.add_handler(CallbackQueryHandler(menu_callback))
     app.add_handler(MessageHandler(filters.TEXT & filters.REPLY, handle_correction))

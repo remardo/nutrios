@@ -15,6 +15,17 @@
     return await res.json();
   }
 
+  function notify(text){
+    try{
+      if (tg?.showAlert) tg.showAlert(text);
+      else alert(text);
+    }catch(e){ /* ignore */ }
+  }
+
+  function todayISO(){
+    return new Date().toISOString().slice(0,10);
+  }
+
   function userIdFromTG(){
     try{
       if (debugUser) return parseInt(debugUser,10);
@@ -92,6 +103,77 @@
     el.innerHTML = `Текущая серия: <b>${s.streak}</b> ${s.met_goal_7? '🔥 Цель 7 дней достигнута!' : ''}`;
   }
 
+  async function loadDailyMetrics(){
+    const el = document.getElementById('dailyMetricsStatus');
+    if (!el) return;
+    try{
+      const today = todayISO();
+      const rows = await fetchJSON(`/clients/${clientId}/metrics/daily?start_date=${today}&end_date=${today}&limit=1`);
+      if (!rows.length){
+        el.textContent = 'Нет данных за сегодня';
+        el.classList.add('muted');
+        return;
+      }
+      const m = rows[0];
+      const parts = [];
+      parts.push(`Вода: ${m.water_goal_met ? '✅' : '—'}`);
+      parts.push(`Шаги: ${m.steps != null ? m.steps : '—'}`);
+      parts.push(`Белок: ${m.protein_goal_met ? '✅' : '—'}`);
+      parts.push(`Клетчатка: ${m.fiber_goal_met ? '✅' : '—'}`);
+      parts.push(`Завтрак до 10: ${m.breakfast_logged_before_10 ? '✅' : '—'}`);
+      parts.push(`Ужин: ${m.dinner_logged ? '✅' : '—'}`);
+      parts.push(`Новый рецепт: ${m.new_recipe_logged ? '✅' : '—'}`);
+      el.textContent = parts.join(' · ');
+      el.classList.remove('muted');
+    }catch(e){
+      el.textContent = 'Не удалось загрузить отметки';
+      el.classList.add('muted');
+    }
+  }
+
+  function formatEvent(row){
+    const dt = row.occurred_at || row.created_at;
+    let when = '';
+    try{
+      const d = new Date(dt);
+      when = d.toLocaleString('ru-RU', { hour: '2-digit', minute:'2-digit', day:'2-digit', month:'2-digit' });
+    }catch(e){ when = dt || ''; }
+    let payload = '';
+    if (row.payload && Object.keys(row.payload).length){
+      payload = Object.entries(row.payload).map(([k,v]) => `${k}: ${v}`).join(', ');
+    }
+    return `<div class="event-item"><b>${row.type}</b> · ${when}${payload?`<div class="muted">${payload}</div>`:''}</div>`;
+  }
+
+  async function loadEvents(){
+    const el = document.getElementById('eventsList');
+    if (!el) return;
+    try{
+      const rows = await fetchJSON(`/clients/${clientId}/events?limit=5`);
+      if (!rows.length){
+        el.textContent = 'События ещё не фиксировались';
+        el.classList.add('muted');
+        return;
+      }
+      el.classList.remove('muted');
+      el.innerHTML = rows.map(formatEvent).join('');
+    }catch(e){
+      el.textContent = 'Не удалось загрузить события';
+      el.classList.add('muted');
+    }
+  }
+
+  async function upsertDailyMetric(fields){
+    const body = Object.assign({ date: todayISO() }, fields);
+    await fetchJSON(`/clients/${clientId}/metrics/daily`, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  }
+
+  async function postEvent(type, payload={}, extras={}){
+    const body = Object.assign({ type }, extras);
+    if (payload && Object.keys(payload).length) body.payload = payload;
+    await fetchJSON(`/clients/${clientId}/events`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  }
+
   async function submitQuiz(ev){
     ev.preventDefault();
     const form = ev.target;
@@ -120,7 +202,9 @@
       await loadTargets();
       await loadDaily();
       await loadWeekly();
+      await loadDailyMetrics();
       await loadStreak();
+      await loadEvents();
       await loadTips();
     }catch(e){
       alert('Ошибка инициализации: '+e.message);
@@ -130,6 +214,72 @@
   document.getElementById('quiz').addEventListener('submit', submitQuiz);
   document.getElementById('refresh').addEventListener('click', boot);
   document.getElementById('editTargets').addEventListener('click', editTargets);
+  document.getElementById('markWater').addEventListener('click', async ev => {
+    ev.preventDefault();
+    try{
+      await upsertDailyMetric({ water_goal_met: true });
+      await loadDailyMetrics();
+      notify('Отметка по воде сохранена');
+    }catch(e){ notify('Ошибка: '+e.message); }
+  });
+  document.getElementById('markDinner').addEventListener('click', async ev => {
+    ev.preventDefault();
+    try{
+      await upsertDailyMetric({ dinner_logged: true });
+      await loadDailyMetrics();
+      notify('Ужин отмечен');
+    }catch(e){ notify('Ошибка: '+e.message); }
+  });
+  document.getElementById('markNewRecipe').addEventListener('click', async ev => {
+    ev.preventDefault();
+    try{
+      await upsertDailyMetric({ new_recipe_logged: true });
+      await loadDailyMetrics();
+      notify('Новый рецепт сохранён');
+    }catch(e){ notify('Ошибка: '+e.message); }
+  });
+  document.getElementById('stepsForm').addEventListener('submit', async ev => {
+    ev.preventDefault();
+    const input = document.getElementById('stepsInput');
+    const value = Number(input.value || '');
+    if (!value || value < 0){ notify('Введите количество шагов'); return; }
+    try{
+      await upsertDailyMetric({ steps: value });
+      input.value = '';
+      await loadDailyMetrics();
+      notify(`Шаги (${value}) сохранены`);
+    }catch(e){ notify('Ошибка: '+e.message); }
+  });
+  document.getElementById('btnChallenge').addEventListener('click', async ev => {
+    ev.preventDefault();
+    const title = prompt('Название или описание челленджа?');
+    if (title === null) return;
+    if (!title.trim()){ notify('Введите описание челленджа'); return; }
+    try{
+      await postEvent('challenge_completed', { title: title.trim() });
+      await loadEvents();
+      notify('Отлично! Челлендж зафиксирован');
+    }catch(e){ notify('Ошибка: '+e.message); }
+  });
+  document.getElementById('btnShareProgress').addEventListener('click', async ev => {
+    ev.preventDefault();
+    const note = prompt('Чем поделиться?');
+    if (note === null) return;
+    if (!note.trim()){ notify('Введите текст'); return; }
+    try{
+      await postEvent('shared_progress', { note: note.trim() });
+      await loadEvents();
+      notify('Отправлено! Поделились прогрессом.');
+    }catch(e){ notify('Ошибка: '+e.message); }
+  });
+  document.getElementById('btnStreakResumed').addEventListener('click', async ev => {
+    ev.preventDefault();
+    try{
+      await postEvent('streak_resumed', {});
+      await loadEvents();
+      notify('Серия отмечена как возобновлённая');
+    }catch(e){ notify('Ошибка: '+e.message); }
+  });
   boot();
 
   function renderDailyChart(rows){
