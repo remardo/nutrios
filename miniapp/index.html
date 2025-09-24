@@ -34,6 +34,25 @@
       </section>
 
       <section class="card">
+        <div class="section-title">Челленджи</div>
+        <div id="challengesActive" class="challenge-list"></div>
+        <div id="challengeSuggestion" class="muted"></div>
+      </section>
+
+      <section class="card">
+        <div class="section-title">Дневник привычек</div>
+        <form id="habitForm" class="form-grid">
+          <label>Дата<input type="date" id="habitDate" name="date" /></label>
+          <label>Вода, мл<input type="number" name="water_ml" min="0" step="100" /></label>
+          <label>Шаги<input type="number" name="steps" min="0" step="100" /></label>
+          <label>Овощи, г<input type="number" name="vegetables_g" min="0" step="50" /></label>
+          <label>Сладкое<select name="had_sweets"><option value="false">Нет</option><option value="true">Да</option></select></label>
+          <button class="btn" type="submit">Сохранить</button>
+        </form>
+        <div id="habitStatus" class="muted"></div>
+      </section>
+
+      <section class="card">
         <div class="section-title">Опросник (цели и состояние)</div>
         <form id="quiz" class="form-grid">
           <label>Возраст<input type="number" name="age" min="10" max="100" /></label>
@@ -56,6 +75,6 @@
       <button id="refresh" class="btn">Обновить</button>
     </footer>
 
-    <script src="./app.js?v=20250916-2"></script>
+    <script src="./app.js?v=20250916-3"></script>
   </body>
   </html>

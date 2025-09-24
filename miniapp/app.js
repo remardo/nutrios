@@ -29,6 +29,21 @@
 
   function pct(v){ if (v==null) return '-'; return (v>=100?`<span class="ok">${v}%</span>`:(v>=80?`${v}%`:`<span class="warn">${v}%</span>`)); }
 
+  function todayISO(){ return new Date().toISOString().slice(0,10); }
+
+  function safeNumber(v){ const n = Number(v); return Number.isFinite(n) ? Math.round(n) : 0; }
+
+  function renderChallenge(row){
+    const progress = row.progress || {};
+    const meta = progress.meta || row.meta || {};
+    const unit = meta.unit ? ` ${meta.unit}` : '';
+    const value = safeNumber(progress.value);
+    const target = safeNumber(progress.target_value != null ? progress.target_value : row.target_value);
+    const status = (progress.completed || row.status === 'completed') ? '✅' : (row.status === 'failed' ? '❌' : '🔥');
+    const period = (row.start_date && row.end_date) ? `<div class="meta">Период: ${row.start_date} – ${row.end_date}</div>` : '';
+    return `<div class="challenge-item"><div class="title">${status} ${row.name || row.code || 'Челлендж'}</div><div class="meta">Прогресс: ${value}/${target}${unit}</div>${period}</div>`;
+  }
+
   async function resolveClient(){
     const uid = userIdFromTG();
     if (!uid) throw new Error('Не найден Telegram user id');
@@ -92,6 +107,89 @@
     el.innerHTML = `Текущая серия: <b>${s.streak}</b> ${s.met_goal_7? '🔥 Цель 7 дней достигнута!' : ''}`;
   }
 
+  async function loadChallenges(){
+    if (!clientId) return;
+    const listEl = document.getElementById('challengesActive');
+    const suggestEl = document.getElementById('challengeSuggestion');
+    try{
+      const active = await fetchJSON(`/clients/${clientId}/challenges/active`);
+      if (!active.length){
+        listEl.innerHTML = '<div class="muted">Пока нет активных челленджей</div>';
+      } else {
+        listEl.innerHTML = active.map(renderChallenge).join('');
+      }
+      const available = await fetchJSON(`/clients/${clientId}/challenges/available`);
+      const suggestion = (available||[]).find(row => !row.already_active);
+      if (suggestion){
+        const unit = suggestion.meta?.unit ? ` ${suggestion.meta.unit}` : '';
+        const target = safeNumber(suggestion.suggested_target ?? suggestion.target_value);
+        suggestEl.innerHTML = `Следующий шаг: <b>${suggestion.name || suggestion.code}</b> — цель ${target}${unit}.`;
+      } else {
+        suggestEl.innerHTML = '';
+      }
+    }catch(e){
+      listEl.innerHTML = '<div class="muted">Не удалось загрузить челленджи</div>';
+      suggestEl.innerHTML = '';
+    }
+  }
+
+  function renderHabitStatus(row){
+    const el = document.getElementById('habitStatus');
+    if (!el) return;
+    el.innerHTML = [
+      `Вода: <b>${row.water_ml || 0}</b> мл`,
+      `Овощи: <b>${row.vegetables_g || 0}</b> г`,
+      `Шаги: <b>${row.steps || 0}</b>`,
+      `Сладкое: <b>${row.had_sweets ? 'да' : 'нет'}</b>`,
+      `Приёмов: <b>${row.logged_meals || 0}</b>`
+    ].join('<br/>');
+  }
+
+  async function loadHabit(dateStr){
+    if (!clientId || !dateStr) return;
+    try{
+      const data = await fetchJSON(`/clients/${clientId}/habits/${dateStr}`);
+      const form = document.getElementById('habitForm');
+      if (form){
+        if (form.elements['date']) form.elements['date'].value = dateStr;
+        if (form.elements['water_ml']) form.elements['water_ml'].value = data.water_ml ?? '';
+        if (form.elements['steps']) form.elements['steps'].value = data.steps ?? '';
+        if (form.elements['vegetables_g']) form.elements['vegetables_g'].value = data.vegetables_g ?? '';
+        if (form.elements['had_sweets']) form.elements['had_sweets'].value = data.had_sweets ? 'true' : 'false';
+      }
+      renderHabitStatus(data);
+    }catch(e){
+      const status = document.getElementById('habitStatus');
+      if (status) status.innerHTML = 'Не удалось загрузить данные.';
+    }
+  }
+
+  async function submitHabit(ev){
+    ev.preventDefault();
+    if (!clientId) return;
+    const form = ev.target;
+    const dateStr = form.elements['date']?.value || todayISO();
+    const payload = {};
+    ['water_ml','steps','vegetables_g'].forEach(key => {
+      const field = form.elements[key];
+      if (field && field.value !== '') payload[key] = Number(field.value);
+    });
+    const sweets = form.elements['had_sweets']?.value;
+    if (sweets === 'true' || sweets === 'false') payload.had_sweets = (sweets === 'true');
+    try{
+      await fetchJSON(`/clients/${clientId}/habits/${dateStr}`, {
+        method:'PUT',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      await loadHabit(dateStr);
+      await loadChallenges();
+    }catch(e){
+      const status = document.getElementById('habitStatus');
+      if (status) status.innerHTML = 'Ошибка сохранения.';
+    }
+  }
+
   async function submitQuiz(ev){
     ev.preventDefault();
     const form = ev.target;
@@ -122,6 +220,11 @@
       await loadWeekly();
       await loadStreak();
       await loadTips();
+      const habitDate = document.getElementById('habitDate');
+      const dateValue = habitDate?.value || todayISO();
+      if (habitDate && !habitDate.value) habitDate.value = dateValue;
+      await loadHabit(dateValue);
+      await loadChallenges();
     }catch(e){
       alert('Ошибка инициализации: '+e.message);
     }
@@ -130,6 +233,8 @@
   document.getElementById('quiz').addEventListener('submit', submitQuiz);
   document.getElementById('refresh').addEventListener('click', boot);
   document.getElementById('editTargets').addEventListener('click', editTargets);
+  document.getElementById('habitForm').addEventListener('submit', submitHabit);
+  document.getElementById('habitDate').addEventListener('change', ev => loadHabit(ev.target.value));
   boot();
 
   function renderDailyChart(rows){
