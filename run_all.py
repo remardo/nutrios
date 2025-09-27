@@ -79,7 +79,7 @@ def start_bot() -> str:
     env = os.environ.copy()
     # Ensure bot and repo root are on import path for relative imports
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [env.get("PYTHONPATH"), ROOT, os.path.join(ROOT, "bot")]))
-    p = subprocess.Popen([PY, os.path.join(ROOT, "bot", "main.py")], cwd=ROOT, env=env)
+    p = subprocess.Popen([PY, "-m", "bot.main"], cwd=ROOT, env=env)
     procs.append(p)
     return "Bot started (token ok)" if token_ok else "Bot started (token check failed or missing)"
 

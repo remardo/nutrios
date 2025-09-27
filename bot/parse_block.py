@@ -105,6 +105,25 @@ def parse_formatted_block(block: str) -> Dict[str, Any]:
             if line.strip().startswith("• "): micro.append(line.strip()[2:])
     data["micronutrients"] = micro[:5]
 
+    # Специальные группы
+    special_groups = {"cruciferous": "нет", "iron_type": "нет", "antioxidants_count": 0}
+    take_special = False
+    for line in block.splitlines():
+        if line.startswith("Специальные группы:"):
+            take_special = True; continue
+        if take_special:
+            if line.startswith("Допущения:"): break
+            if "Крестоцветные овощи:" in line:
+                m = re.search(r"Крестоцветные овощи:\s*(да|нет)", line)
+                if m: special_groups["cruciferous"] = m.group(1)
+            elif "Железо:" in line:
+                m = re.search(r"Железо:\s*(гемовое|негемовое|нет)", line)
+                if m: special_groups["iron_type"] = m.group(1)
+            elif "Антиоксиданты:" in line:
+                m = re.search(r"Антиоксиданты:\s*(\d+)", line)
+                if m: special_groups["antioxidants_count"] = int(m.group(1))
+    data["special_groups"] = special_groups
+
     # Допущения (берём строки после "Допущения:")
     assum: List[str] = []
     take = False

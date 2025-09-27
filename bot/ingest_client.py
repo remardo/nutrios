@@ -1,7 +1,14 @@
 import logging
 import httpx
+import os
 from typing import Dict, Any
-from config import ADMIN_API_BASE, ADMIN_API_KEY
+from dotenv import load_dotenv
+
+# Load .env from project root
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
+
+ADMIN_API_BASE = os.getenv("ADMIN_API_BASE", "http://localhost:8000")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "supersecret")
 
 def ingest_meal(payload: Dict[str, Any]) -> None:
     """

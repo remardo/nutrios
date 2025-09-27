@@ -5,6 +5,10 @@ from typing import Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pathlib import Path
+from typing import Any
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
@@ -50,8 +54,396 @@ except Exception:
     pass
 init_db(Base)
 ensure_meals_extras_column()
-# mount mini app static
-app.mount("/miniapp", StaticFiles(directory="miniapp", html=True), name="miniapp")
+# NOTE: We will serve SPA at root from a separate root app, see bottom of file.
+
+# -----------------------------
+# BFF (Backend-For-Frontend) for NutriTracker-Pro web
+# Provides thin-compatible endpoints mapped to our domain API so that
+# the exported SPA can work without changing its network layer.
+
+def _resolve_client_id(
+    *,
+    db: Session,
+    cid: int | None = None,
+    tg: int | None = None,
+) -> int:
+    """Resolve a client id, optionally auto-provisioning by telegram id.
+
+    Priority: explicit cid > telegram id (tg). If neither provided, raise 401.
+    """
+    if cid:
+        row = db.query(Client).filter_by(id=cid).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Client not found")
+        return row.id
+    if tg:
+        row = db.query(Client).filter_by(telegram_user_id=tg).first()
+        if not row:
+            row = Client(telegram_user_id=tg)
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        return row.id
+    raise HTTPException(status_code=401, detail="cid or tg is required")
+
+
+@app.get("/ntp/user")
+def ntp_user(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    row = db.query(Client).filter_by(id=client_id).first()
+    return {
+        "id": row.id,
+        "telegram_user_id": row.telegram_user_id,
+        "username": row.telegram_username,
+    }
+
+
+@app.get("/ntp/goals")
+def ntp_goals(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    data = get_targets(client_id, db)
+    try:
+        if not data.get("profile"):
+            data["profile"] = {"status": "seeded", "completed": True}
+    except Exception:
+        pass
+    return data
+
+
+class NTPGoals(BaseModel):
+    # Accept both our names and generic ones from a foreign UI
+    kcal: int | None = None
+    protein_g: int | None = None
+    fat_g: int | None = None
+    carbs_g: int | None = None
+    kcal_target: int | None = None
+    protein_target_g: int | None = None
+    fat_target_g: int | None = None
+    carbs_target_g: int | None = None
+
+
+@app.put("/ntp/goals")
+def ntp_put_goals(
+    payload: NTPGoals,
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    # Normalise incoming fields
+    body = {
+        "kcal_target": payload.kcal_target or payload.kcal or 2000,
+        "protein_target_g": payload.protein_target_g or payload.protein_g or 100,
+        "fat_target_g": payload.fat_target_g or payload.fat_g or 70,
+        "carbs_target_g": payload.carbs_target_g or payload.carbs_g or 250,
+    }
+    return put_targets(client_id, Targets(**body), db)
+
+
+@app.get("/ntp/progress/daily")
+def ntp_progress_daily(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    return daily_summary(client_id, db)
+
+
+@app.get("/ntp/progress/weekly")
+def ntp_progress_weekly(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    return weekly_summary(client_id, db)
+
+
+@app.get("/ntp/streak")
+def ntp_streak(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    return get_streak(client_id, db)  # type: ignore[name-defined]
+
+
+@app.get("/ntp/tips")
+def ntp_tips(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    return tips_today(client_id, db)
+
+
+# -----------------------------
+# Meals (create/list/update/delete) for NutriTracker-Pro
+
+class NTPMeal(BaseModel):
+    # Flexible field names to accept various clients
+    title: str | None = None
+    portion_g: int | None = None
+    kcal: int | None = None
+    calories: int | None = None
+    protein_g: int | None = None
+    protein: int | None = None
+    fat_g: int | None = None
+    fat: int | None = None
+    carbs_g: int | None = None
+    carbs: int | None = None
+    captured_at_iso: str | None = None  # ISO string
+    captured_at: str | None = None      # alternative name
+    source_type: str | None = None
+    image_url: str | None = None
+    image_path: str | None = None  # allow alternate field name from clients
+    micronutrients: list[str] | None = None
+    flags: dict | None = None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _coerce_int(value: Any, default: int | None = None) -> int | None:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@app.post("/ntp/meal")
+def ntp_add_meal(
+    payload: NTPMeal,
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    title = payload.title or "Meal"
+    portion_g = _coerce_int(payload.portion_g)
+    kcal = _coerce_int(payload.kcal, _coerce_int(payload.calories, 0)) or 0
+    protein_g = _coerce_int(payload.protein_g, _coerce_int(payload.protein, 0)) or 0
+    fat_g = _coerce_int(payload.fat_g, _coerce_int(payload.fat, 0)) or 0
+    carbs_g = _coerce_int(payload.carbs_g, _coerce_int(payload.carbs, 0)) or 0
+
+    ts_str = payload.captured_at_iso or payload.captured_at or _now_iso()
+    try:
+        captured_dt = datetime.fromisoformat(ts_str)
+    except Exception:
+        captured_dt = datetime.now(timezone.utc)
+
+    # Create Meal row
+    # Choose image url/path from either field
+    image_url_val = payload.image_url or payload.image_path
+    row = Meal(
+        client_id=client_id,
+        message_id=int(datetime.now(timezone.utc).timestamp() * 1000),
+        captured_at=captured_dt,
+        title=title,
+        portion_g=portion_g or 0,
+        kcal=kcal,
+        protein_g=protein_g,
+        fat_g=fat_g,
+        carbs_g=carbs_g,
+        flags=payload.flags or {},
+        micronutrients=payload.micronutrients or [],
+        assumptions=[],
+        extras=None,
+        source_type=payload.source_type or "web",
+        image_path=image_url_val,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"ok": True, "meal": {
+        "id": row.id,
+        "captured_at": row.captured_at.isoformat(),
+        "title": row.title,
+        "portion_g": row.portion_g,
+        "kcal": row.kcal,
+        "protein_g": row.protein_g,
+        "fat_g": row.fat_g,
+        "carbs_g": row.carbs_g,
+        "image_path": row.image_path,
+        "photo": row.image_path,
+    }}
+
+
+@app.get("/ntp/meals")
+def ntp_list_meals(
+    cid: int | None = None,
+    tg: int | None = None,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    q = db.query(Meal).filter(Meal.client_id == client_id).order_by(Meal.captured_at.desc())
+    if limit:
+        q = q.limit(int(limit))
+    rows = q.all()
+    return [{
+        "id": r.id,
+        "captured_at": r.captured_at.isoformat(),
+        "title": r.title,
+        "portion_g": r.portion_g,
+        "kcal": r.kcal,
+        "protein_g": r.protein_g,
+        "fat_g": r.fat_g,
+        "carbs_g": r.carbs_g,
+        "image_path": r.image_path,
+        "photo": r.image_path,
+        "source_type": r.source_type,
+    } for r in rows]
+
+
+class NTPMealPatch(BaseModel):
+    title: str | None = None
+    portion_g: int | None = None
+    kcal: int | None = None
+    protein_g: int | None = None
+    fat_g: int | None = None
+    carbs_g: int | None = None
+    image_url: str | None = None
+    image_path: str | None = None
+
+
+@app.put("/ntp/meals/{meal_id}")
+def ntp_update_meal(
+    meal_id: int,
+    payload: NTPMealPatch,
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    meal = db.query(Meal).filter(Meal.id == meal_id, Meal.client_id == client_id).first()
+    if not meal:
+        raise HTTPException(status_code=404, detail="meal not found")
+    for field in ["title", "portion_g", "kcal", "protein_g", "fat_g", "carbs_g"]:
+        value = getattr(payload, field)
+        if value is not None:
+            setattr(meal, field, value)
+    if payload.image_url is not None or payload.image_path is not None:
+        meal.image_path = payload.image_url or payload.image_path
+    db.commit()
+    db.refresh(meal)
+    return {"ok": True}
+
+
+@app.get("/ntp/day/quality")
+def ntp_day_quality(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
+    """Return today's daily quality summary for mini app (BFF).
+    Includes kcal, macros grams and percents, saturated fat %, fiber, omega ratio,
+    and counts for crucifers, heme/non-heme iron and antioxidants mentions.
+    """
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    from datetime import date as _date
+
+    # Macros daily summary
+    df = df_meals(db, client_id)
+    agg = summary_macros(df, freq="D")
+    today = _date.today()
+    kcal = p_g = f_g = c_g = 0.0
+    if agg is not None and not getattr(agg, "empty", True):
+        try:
+            row = agg[agg["captured_at"].dt.date == today]
+            if row is None or row.empty:
+                row = agg.iloc[[-1]]
+            row0 = row.iloc[0]
+            kcal = float(row0["kcal"] or 0.0)
+            p_g = float(row0["protein_g"] or 0.0)
+            f_g = float(row0["fat_g"] or 0.0)
+            c_g = float(row0["carbs_g"] or 0.0)
+        except Exception:
+            pass
+
+    def _pct(val_kcal: float, total_kcal: float) -> float | None:
+        try:
+            return float((val_kcal / total_kcal) * 100.0) if total_kcal > 0 else None
+        except Exception:
+            return None
+
+    p_pct = _pct(p_g * 4.0, kcal)
+    f_pct = _pct(f_g * 9.0, kcal)
+    c_pct = _pct(c_g * 4.0, kcal)
+
+    # Extras daily: saturated, fiber, omega
+    ex = summary_extras(df, freq="D")
+    sat_pct = None
+    fiber_total = None
+    omega_ratio = None
+    if ex is not None and not getattr(ex, "empty", True):
+        try:
+            row = ex[ex["captured_at"].dt.date == today]
+            if row is None or row.empty:
+                row = ex.iloc[[-1]]
+            row0 = row.iloc[0]
+            sat_g = row0.get("fats_saturated")
+            fiber_total = float(row0.get("fiber_total")) if row0.get("fiber_total") is not None else None
+            omega_ratio = float(row0.get("omega_ratio_num")) if row0.get("omega_ratio_num") is not None else None
+            if sat_g is not None and kcal > 0:
+                sat_pct = float(sat_g) * 9.0 / float(kcal) * 100.0
+        except Exception:
+            pass
+
+    # Counts from meals: crucifers, iron, antioxidants
+    crucifer_meals = heme_cnt = nonheme_cnt = antiox_mentions = 0
+    try:
+        if df is not None and not getattr(df, "empty", True):
+            day = df[df["captured_at"].dt.date == today]
+            crucifer_kw = {
+                "брокколи","цветная капуста","капуста","брюссельская","кейл","листовая капуста","пекинская капуста","пак-чой","пак чой","кольраби","редис","редька","руккола","кресс",
+                "broccoli","cauliflower","cabbage","brussels","kale","bok choy","pak choi","collard","kohlrabi","radish","arugula","rocket","mustard greens","turnip greens","watercress",
+            }
+            meat_fish_kw = {
+                "говядина","телятина","свинина","баранина","печень","сердце","курица","индейка","утка","рыба","семга","лосось","тунец","сардина","печень трески",
+                "beef","veal","pork","lamb","liver","offal","chicken","turkey","duck","fish","salmon","tuna","sardine","cod liver","steak",
+            }
+            antioxidants_kw = {
+                "витамин c","аскорбиновая","витамин е","токоферол","каротиноиды","бета-каротин","ликопин","лютеин","зеаксантин","селен","полифенолы","флавоноиды","ресвератрол","кверцетин","антоцианы","катехины",
+                "vitamin c","ascorbic","vitamin e","tocopherol","carotenoids","beta-carotene","lycopene","lutein","zeaxanthin","selenium","polyphenols","flavonoids","resveratrol","quercetin","anthocyanins","catechins",
+            }
+            for _, r in day.iterrows():
+                title = str(r.get("title") or "").lower()
+                if any(k in title for k in crucifer_kw):
+                    crucifer_meals += 1
+                micro = [str(x).lower() for x in (r.get("micronutrients") or []) if x]
+                # iron detection
+                has_iron = any((("железо" in x) or ("iron" in x)) for x in micro)
+                if has_iron:
+                    flags = r.get("flags") or {}
+                    is_veg = bool(flags.get("vegan") or flags.get("vegetarian"))
+                    if any(k in title for k in meat_fish_kw) and not is_veg:
+                        heme_cnt += 1
+                    else:
+                        nonheme_cnt += 1
+                antiox_mentions += sum(1 for x in micro if any(k in x for k in antioxidants_kw))
+    except Exception:
+        pass
+
+    return {
+        "date": today.isoformat(),
+        "kcal": round(kcal, 0),
+        "protein_g": round(p_g, 1),
+        "fat_g": round(f_g, 1),
+        "carbs_g": round(c_g, 1),
+        "p_pct": None if p_pct is None else round(p_pct, 1),
+        "f_pct": None if f_pct is None else round(f_pct, 1),
+        "c_pct": None if c_pct is None else round(c_pct, 1),
+        "sat_pct": None if sat_pct is None else round(sat_pct, 1),
+        "fiber_total": fiber_total,
+        "omega_ratio": omega_ratio,
+        "crucifer_meals": crucifer_meals,
+        "heme_iron_meals": heme_cnt,
+        "nonheme_iron_meals": nonheme_cnt,
+        "antioxidants_mentions": antiox_mentions,
+    }
+
+
+@app.delete("/ntp/meals/{meal_id}")
+def ntp_delete_meal(
+    meal_id: int,
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+) -> dict:
+    client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
+    meal = db.query(Meal).filter(Meal.id == meal_id, Meal.client_id == client_id).first()
+    if not meal:
+        raise HTTPException(status_code=404, detail="meal not found")
+    db.delete(meal)
+    db.commit()
+    return {"ok": True}
 
 # ----- Schemas -----
 class IngestMeal(BaseModel):
@@ -140,7 +532,11 @@ def client_by_telegram(telegram_user_id: int, db: Session = Depends(get_db), X_T
         raise HTTPException(status_code=401, detail="Missing Telegram auth")
     row = db.query(Client).filter_by(telegram_user_id=telegram_user_id).first()
     if not row:
-        raise HTTPException(status_code=404, detail="Client not found")
+        # Auto-provision client on first authorised access to simplify onboarding for miniapp
+        row = Client(telegram_user_id=telegram_user_id)
+        db.add(row)
+        db.commit()
+        db.refresh(row)
     return {"id": row.id, "telegram_user_id": row.telegram_user_id, "telegram_username": row.telegram_username}
 
 @app.get("/clients/{client_id}/meals")
@@ -740,3 +1136,130 @@ def weekly_extras(client_id: int, db: Session = Depends(get_db)):
     df = df_meals(db, client_id)
     agg = summary_extras(df, freq="W")
     return json_safe_extras(agg)
+
+# Allow dev origins (e.g., Expo 19006) to call API during debugging (applies to API app; root app will serve SPA)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Add CSP relaxed enough for Expo Web runtime (allows eval for RN web/wasm)
+@app.middleware("http")
+async def add_csp_headers(request: Request, call_next):  # type: ignore[override]
+    response = await call_next(request)
+    # API app: relax CSP for all responses under /api when mounted (root app also sets CSP for static)
+    path = request.url.path
+    if True:
+        csp = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' blob:; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "font-src 'self' data:; "
+            "connect-src 'self' *; "
+            "worker-src 'self' blob:; "
+            "frame-ancestors 'self'; "
+            "base-uri 'self'"
+        )
+        response.headers.setdefault("Content-Security-Policy", csp)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response
+
+
+# -----------------------------
+# Root application serving SPA at '/'; API mounted at '/api'
+def _build_root_app() -> FastAPI:
+    root = FastAPI(title="Nutrios Root")
+
+    # Mount API under /api
+    root.mount("/api", app)
+
+    # Mount SPA (Expo export)
+    base_dir = Path(__file__).resolve().parents[1]
+    _dist = base_dir / "NutriTracker-Pro" / "NutriTracker-Pro-main" / "dist"
+    # Serve media (photos saved by bot) from /media
+    media_dir = base_dir / "bot" / "downloads"
+    if media_dir.exists():
+        root.mount("/media", StaticFiles(directory=str(media_dir), html=False), name="media")
+    if _dist.exists():
+        # Static assets first to avoid being shadowed by catch-all
+        if (_dist / "_expo").exists():
+            root.mount("/_expo", StaticFiles(directory=str(_dist / "_expo"), html=False), name="expo_static")
+        if (_dist / "assets").exists():
+            root.mount("/assets", StaticFiles(directory=str(_dist / "assets"), html=False), name="expo_assets")
+        # Dedicated routes for exported top-level pages (optional)
+        # Explicit top-level pages
+        # Выберем неонбординговую страницу по умолчанию (например, progress)
+        progress_html = _dist / "progress.html"
+        index_html = _dist / "index.html"
+        onboarding_html = _dist / "onboarding.html"
+        if progress_html.exists():
+            @root.get("/")
+            def _serve_progress(fp=str(progress_html)):
+                return FileResponse(fp)
+        elif index_html.exists():
+            @root.get("/")
+            def _serve_index(fp=str(index_html)):
+                return FileResponse(fp)
+        if onboarding_html.exists():
+            @root.get("/onboarding")
+            def _serve_onboarding(request: Request, fp=str(onboarding_html)):
+                # Разрешаем открывать онбординг только по явному параметру ?open=1
+                qp = dict(request.query_params)
+                if qp.get("open") in {"1", "true", "yes"}:
+                    return FileResponse(fp)
+                # иначе — на главную, сохраняя ?tg=...
+                from fastapi.responses import RedirectResponse
+                query = ("?" + str(request.url.query)) if request.url.query else ""
+                return RedirectResponse(url=f"/{query}", status_code=307)
+        # Catch-all SPA route: serve index.html, client router handles actual path
+        if index_html.exists():
+            @root.get("/{full_path:path}")
+            def _spa_fallback(full_path: str, fp=str(index_html)):
+                # Avoid shadowing asset requests
+                if full_path.startswith(("_expo/", "assets/")):
+                    raise HTTPException(status_code=404, detail="Not Found")
+                return FileResponse(fp)
+    else:
+        # Fallback legacy
+        root.mount("/", StaticFiles(directory="miniapp", html=True), name="spa_legacy")
+
+    from fastapi.responses import RedirectResponse
+
+    @root.get("/miniapp")
+    @root.get("/miniapp/")
+    def _redirect_miniapp(request: Request):  # type: ignore[override]
+        # Раньше вели на /onboarding, теперь — на главную (без опросника)
+        query = ("?" + str(request.url.query)) if request.url.query else ""
+        return RedirectResponse(url=f"/{query}", status_code=307)
+
+    # Duplicate CSP on root to cover static served pages
+    @root.middleware("http")
+    async def _root_csp(request: Request, call_next):  # type: ignore[override]
+        response = await call_next(request)
+        p = request.url.path
+        if p.startswith(("/_expo", "/assets", "/(tabs)", "/onboarding", "/", )):
+            csp = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob:; "
+                "font-src 'self' data:; "
+                "connect-src 'self' *; "
+                "worker-src 'self' blob:; "
+                "frame-ancestors 'self'; "
+                "base-uri 'self'"
+            )
+            response.headers.setdefault("Content-Security-Policy", csp)
+            response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        return response
+
+    return root
+
+
+# Expose root app separately to avoid shadowing API app used in tests
+root_app = _build_root_app()
