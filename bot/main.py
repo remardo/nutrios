@@ -214,7 +214,7 @@ def _send_ingest_from_block(
     message_id: int,
     source_type: str,
     image_path: Optional[str] = None
-) -> None:
+) -> dict | None:
     """Parse bot block and send to Admin API (upsert by message_id)."""
     try:
         parsed = parse_formatted_block(block_text)
@@ -237,8 +237,11 @@ def _send_ingest_from_block(
             "image_path": image_path,
             "message_id": message_id
         })
+        missing_macros = any(parsed.get(k) is None for k in ("protein_g", "fat_g", "carbs_g"))
+        return {"missing_macros": missing_macros}
     except Exception as e:
         log.exception("Failed to ingest meal", exc_info=e)
+        return None
 
 # Ensure sections for detailed fats, omega, fiber are present; if missing, ask LLM to revise-insert them.
 async def ensure_fat_fiber_sections(block: str) -> str:
@@ -306,13 +309,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent = await update.message.reply_text(block)
 
     # --- Admin ingestion ---
-    _send_ingest_from_block(
+    ingest_info = _send_ingest_from_block(
         block_text=block,
         update=update,
         message_id=sent.message_id,
         source_type="image",
         image_path=local_path
     )
+    if ingest_info and ingest_info.get("missing_macros"):
+        await update.message.reply_text("⚠️ Не удалось определить БЖУ для этого блюда. Учтены только калории.")
 
     # --- Local persistence for correction flow ---
     save_interaction(update.effective_chat.id, update.message.message_id, sent.message_id, "image", caption, block)
@@ -346,13 +351,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 # Admin ingestion (update same message_id)
                 dummy_update = update  # for user id/username
-                _send_ingest_from_block(
+                ingest_info = _send_ingest_from_block(
                     block_text=new_block,
                     update=dummy_update,
                     message_id=bot_msg_id,
                     source_type=mode or "text",
                     image_path=None
                 )
+                if ingest_info and ingest_info.get("missing_macros"):
+                    await update.message.reply_text("⚠️ Не удалось определить БЖУ для этого блюда. Учтены только калории.")
                 return
 
     # Fresh text identification
@@ -365,13 +372,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent = await update.message.reply_text(block)
 
     # Admin ingestion
-    _send_ingest_from_block(
+    ingest_info = _send_ingest_from_block(
         block_text=block,
         update=update,
         message_id=sent.message_id,
         source_type="text",
         image_path=None
     )
+    if ingest_info and ingest_info.get("missing_macros"):
+        await update.message.reply_text("⚠️ Не удалось определить БЖУ для этого блюда. Учтены только калории.")
 
     save_interaction(update.effective_chat.id, update.message.message_id, sent.message_id, "text", text, block)
 
@@ -401,13 +410,15 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_interaction_bot_output(bot_msg_id, new_block)
 
     # Admin ingestion (update same message_id)
-    _send_ingest_from_block(
+    ingest_info = _send_ingest_from_block(
         block_text=new_block,
         update=update,
         message_id=bot_msg_id,
         source_type=mode or "text",
         image_path=None
     )
+    if ingest_info and ingest_info.get("missing_macros"):
+        await update.message.reply_text("⚠️ Не удалось определить БЖУ для этого блюда. Учтены только калории.")
 
 async def finalize_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Ок — просто ответьте реплаем, если нужно исправить детали. Команда финализации не требуется 😊")
@@ -540,6 +551,7 @@ async def _build_daily_text(telegram_user_id: int) -> str:
         return "Нет данных за сегодня."
     meals = await _fetch_meals(client_id)
     meals_count = 0
+    unknown_macros_count = 0
     for m in meals:
         ts = m.get("captured_at")
         if not ts:
@@ -547,9 +559,13 @@ async def _build_daily_text(telegram_user_id: int) -> str:
         try:
             if datetime.fromisoformat(ts).astimezone(MSK).date().isoformat() == today_iso:
                 meals_count += 1
+                if any(m.get(k) is None for k in ("protein_g", "fat_g", "carbs_g")):
+                    unknown_macros_count += 1
         except Exception:
             continue
     tail = f"\nУчтено блюд: {meals_count}" if meals_count > 0 else ""
+    if unknown_macros_count > 0:
+        tail += f"\nБЖУ не определено для {unknown_macros_count} блюд(а): в сумме учтены только известные значения."
     return (
         "📊 Сводка за сегодня (" + row_today.get("period_start", '')[:10] + ")\n"
         + _fmt_macros(row_today.get("kcal"), row_today.get("protein_g"), row_today.get("fat_g"), row_today.get("carbs_g"))
