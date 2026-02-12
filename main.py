@@ -16,6 +16,7 @@
 import os, json, base64, sqlite3, logging
 from datetime import datetime, timezone, date, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -55,6 +56,18 @@ client = get_llm_client()
 
 # ------------- DB (SQLite) -------------
 DB_PATH = os.path.join(os.path.dirname(__file__), "state_simple.db")
+MSK = ZoneInfo("Europe/Moscow")
+
+
+def _today_iso_msk() -> str:
+    return datetime.now(MSK).date().isoformat()
+
+
+def _msk_day_bounds_utc() -> tuple[datetime, datetime]:
+    now_msk = datetime.now(MSK)
+    start_msk = datetime.combine(now_msk.date(), datetime.min.time(), tzinfo=MSK)
+    start_utc = start_msk.astimezone(timezone.utc)
+    return start_utc, start_utc + timedelta(days=1)
 
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -532,7 +545,7 @@ async def _build_daily_text(telegram_user_id: int) -> str:
         if txt:
             return txt
         return "Нет данных за сегодня."
-    today_iso = date.today().isoformat()
+    today_iso = _today_iso_msk()
     # Ищем только запись за сегодня; не подставляем "последнюю",
     # иначе получаются некорректные итоги "за сегодня".
     row_today = None
@@ -542,7 +555,16 @@ async def _build_daily_text(telegram_user_id: int) -> str:
     if not row_today:
         return "Нет данных за сегодня."
     meals = await _fetch_meals(client_id)
-    meals_count = sum(1 for m in meals if str(m.get("captured_at", "")).startswith(today_iso))
+    meals_count = 0
+    for m in meals:
+        ts = m.get("captured_at")
+        if not ts:
+            continue
+        try:
+            if datetime.fromisoformat(ts).astimezone(MSK).date().isoformat() == today_iso:
+                meals_count += 1
+        except Exception:
+            continue
     tail = f"\nУчтено блюд: {meals_count}" if meals_count > 0 else ""
     return (
         "📊 Сводка за сегодня (" + row_today.get("period_start", '')[:10] + ")\n"
@@ -593,26 +615,25 @@ def _sum_local_for_period(telegram_user_id: int, start_utc: datetime, end_utc: d
         return None
 
 def _daily_local_summary_text(telegram_user_id: int) -> str | None:
-    now = datetime.now(timezone.utc)
-    start = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc)
-    sums = _sum_local_for_period(telegram_user_id, start, start + timedelta(days=1))
+    start, end = _msk_day_bounds_utc()
+    sums = _sum_local_for_period(telegram_user_id, start, end)
     if not sums:
         return None
     kcal, p, f, carb = sums
     if kcal <= 0 and p <= 0 and f <= 0 and carb <= 0:
         return None
-    return "📊 Сводка за сегодня (" + start.date().isoformat() + ")\n" + _fmt_macros(kcal, p, f, carb)
+    return "📊 Сводка за сегодня (" + start.astimezone(MSK).date().isoformat() + ")\n" + _fmt_macros(kcal, p, f, carb)
 
 def _weekly_local_summary_text(telegram_user_id: int) -> str | None:
-    now = datetime.now(timezone.utc)
-    start = datetime.combine(now.date(), datetime.min.time(), tzinfo=timezone.utc) - timedelta(days=6)
+    day_start_utc, _ = _msk_day_bounds_utc()
+    start = day_start_utc - timedelta(days=6)
     sums = _sum_local_for_period(telegram_user_id, start, start + timedelta(days=7))
     if not sums:
         return None
     kcal, p, f, carb = sums
     if kcal <= 0 and p <= 0 and f <= 0 and carb <= 0:
         return None
-    return "📆 Сводка за неделю (начало " + start.date().isoformat() + ")\n" + _fmt_macros(kcal, p, f, carb)
+    return "📆 Сводка за неделю (начало " + start.astimezone(MSK).date().isoformat() + ")\n" + _fmt_macros(kcal, p, f, carb)
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query

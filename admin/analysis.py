@@ -2,6 +2,16 @@ import pandas as pd
 from sqlalchemy.orm import Session
 from .models import Meal
 
+MSK_TZ = "Europe/Moscow"
+
+
+def _captured_at_moscow(df: pd.DataFrame) -> pd.Series:
+    # Stored timestamps are UTC (or UTC-like naive). Normalize to UTC first,
+    # then convert to Moscow timezone for day/week grouping.
+    ts = pd.to_datetime(df["captured_at"], utc=True, errors="coerce")
+    return ts.dt.tz_convert(MSK_TZ).dt.tz_localize(None)
+
+
 def df_meals(session: Session, client_id: int, date_from=None, date_to=None) -> pd.DataFrame:
     q = session.query(Meal).filter(Meal.client_id==client_id)
     if date_from: q = q.filter(Meal.captured_at >= date_from)
@@ -44,18 +54,24 @@ def df_meals(session: Session, client_id: int, date_from=None, date_to=None) -> 
 
 def summary_macros(df: pd.DataFrame, freq="D"):
     if df.empty: return {}
-    g = df.set_index("captured_at").groupby(pd.Grouper(freq=freq))
+    work = df.copy()
+    work["captured_at"] = _captured_at_moscow(work)
+    work = work.dropna(subset=["captured_at"])
+    g = work.set_index("captured_at").groupby(pd.Grouper(freq=freq))
     agg = g[["kcal","protein_g","fat_g","carbs_g"]].sum().round(0).reset_index()
     return agg
 
 def summary_extras(df: pd.DataFrame, freq="D"):
     if df.empty: return {}
-    g = df.set_index("captured_at").groupby(pd.Grouper(freq=freq))
+    work = df.copy()
+    work["captured_at"] = _captured_at_moscow(work)
+    work = work.dropna(subset=["captured_at"])
+    g = work.set_index("captured_at").groupby(pd.Grouper(freq=freq))
     cols_sum = [
         "fats_total","fats_saturated","fats_mono","fats_poly","fats_trans",
         "omega6","omega3","fiber_total","fiber_soluble","fiber_insoluble"
     ]
-    present = [c for c in cols_sum if c in df.columns]
+    present = [c for c in cols_sum if c in work.columns]
     if not present:
         return pd.DataFrame(columns=["captured_at"])  # empty
     agg = g[present].sum(min_count=1).reset_index()

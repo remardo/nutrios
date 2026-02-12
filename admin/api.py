@@ -2,6 +2,7 @@ import os, hmac, hashlib, json
 from math import isclose
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +26,7 @@ from .models import (
 )
 
 app = FastAPI(title="Nutrios Admin API")
+MSK = ZoneInfo("Europe/Moscow")
 
 
 EXPERIMENT_STATUS_DRAFT = "draft"
@@ -648,7 +650,7 @@ def tips_today(client_id: int, db: Session = Depends(get_db)):
         # pick today or latest
         row = None
         if agg is not None and not getattr(agg, "empty", True):
-            today = datetime.now().date().isoformat()
+            today = datetime.now(MSK).date().isoformat()
             for _, r in agg.iterrows():
                 if str(r["captured_at"]).startswith(today):
                     row = r
