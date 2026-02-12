@@ -64,9 +64,9 @@ class IngestMeal(BaseModel):
     portion_g: int
     confidence: int
     kcal: int
-    protein_g: Optional[int] = None
-    fat_g: Optional[int] = None
-    carbs_g: Optional[int] = None
+    protein_g: Optional[float] = None
+    fat_g: Optional[float] = None
+    carbs_g: Optional[float] = None
     flags: dict
     micronutrients: List[str] = []
     assumptions: List[str] = []

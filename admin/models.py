@@ -20,9 +20,9 @@ class Meal(Base):
     portion_g = Column(Integer)
     confidence = Column(Integer)
     kcal = Column(Integer)
-    protein_g = Column(Integer)
-    fat_g = Column(Integer)
-    carbs_g = Column(Integer)
+    protein_g = Column(Float)
+    fat_g = Column(Float)
+    carbs_g = Column(Float)
     flags = Column(JSON)             # {vegetarian, vegan, glutenfree, lactosefree}
     micronutrients = Column(JSON)    # ["Витамин C — 30 mg",...]
     assumptions = Column(JSON)

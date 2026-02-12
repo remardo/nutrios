@@ -58,7 +58,7 @@ def summary_macros(df: pd.DataFrame, freq="D"):
     work["captured_at"] = _captured_at_moscow(work)
     work = work.dropna(subset=["captured_at"])
     g = work.set_index("captured_at").groupby(pd.Grouper(freq=freq))
-    agg = g[["kcal","protein_g","fat_g","carbs_g"]].sum().round(0).reset_index()
+    agg = g[["kcal","protein_g","fat_g","carbs_g"]].sum().reset_index()
     return agg
 
 def summary_extras(df: pd.DataFrame, freq="D"):

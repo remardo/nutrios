@@ -519,13 +519,25 @@ async def _fetch_meals(client_id: int):
         return []
 
 def _fmt_macros(kcal, p, f, c):
-    def _n(v):
+    def _k(v):
         try:
-            if v is None: return 0
-            return int(round(float(v)))
+            if v is None:
+                return "0"
+            x = float(v)
+            return str(int(round(x)))
         except Exception:
-            return 0
-    return f"Калории: {_n(kcal)} ккал\nБелки: {_n(p)} г · Жиры: {_n(f)} г · Углеводы: {_n(c)} г"
+            return "0"
+
+    def _m(v):
+        try:
+            if v is None:
+                return "0"
+            x = float(v)
+            s = f"{x:.1f}"
+            return s[:-2] if s.endswith(".0") else s
+        except Exception:
+            return "0"
+    return f"Калории: {_k(kcal)} ккал\nБелки: {_m(p)} г · Жиры: {_m(f)} г · Углеводы: {_m(c)} г"
 
 async def _build_daily_text(telegram_user_id: int) -> str:
     client_id = await _fetch_client_id(telegram_user_id)

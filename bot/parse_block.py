@@ -57,11 +57,11 @@ def parse_formatted_block(block: str) -> Dict[str, Any]:
         f = _num_from_text(m.group(2))
         c = _num_from_text(m.group(3))
         if p is not None:
-            data["protein_g"] = int(round(p))
+            data["protein_g"] = float(p)
         if f is not None:
-            data["fat_g"] = int(round(f))
+            data["fat_g"] = float(f)
         if c is not None:
-            data["carbs_g"] = int(round(c))
+            data["carbs_g"] = float(c)
 
     # Расширенный разбор жиров (если присутствует в блоке)
     # Примеры ожидаемых строк:
