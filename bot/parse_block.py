@@ -1,6 +1,61 @@
 import re
 from typing import Dict, Any, List
 
+def _num_from_text(value: str | None) -> float | None:
+    if value is None:
+        return None
+    s = str(value).strip().replace(",", ".")
+    s = s.replace("<", "").replace(">", "")
+    m = re.search(r"\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def _ensure_macros_estimated(data: Dict[str, Any]) -> None:
+    kcal = _num_from_text(data.get("kcal")) or 360.0
+    if kcal <= 0:
+        kcal = 360.0
+
+    p = _num_from_text(data.get("protein_g"))
+    f = _num_from_text(data.get("fat_g"))
+    c = _num_from_text(data.get("carbs_g"))
+
+    # Default split by calories: protein 20%, fat 30%, carbs 50%.
+    default_kcal_share = {"protein_g": 0.20, "fat_g": 0.30, "carbs_g": 0.50}
+    kcal_per_g = {"protein_g": 4.0, "fat_g": 9.0, "carbs_g": 4.0}
+
+    known_kcal = (p or 0) * 4.0 + (f or 0) * 9.0 + (c or 0) * 4.0
+    remaining_kcal = max(0.0, kcal - known_kcal)
+
+    missing = []
+    if p is None:
+        missing.append("protein_g")
+    if f is None:
+        missing.append("fat_g")
+    if c is None:
+        missing.append("carbs_g")
+
+    if missing:
+        share_sum = sum(default_kcal_share[k] for k in missing)
+        for key in missing:
+            part_kcal = remaining_kcal * (default_kcal_share[key] / share_sum if share_sum > 0 else 0.0)
+            grams = part_kcal / kcal_per_g[key]
+            if key == "protein_g":
+                p = grams
+            elif key == "fat_g":
+                f = grams
+            else:
+                c = grams
+
+    data["protein_g"] = max(0, int(round(p or 0)))
+    data["fat_g"] = max(0, int(round(f or 0)))
+    data["carbs_g"] = max(0, int(round(c or 0)))
+
+
 def parse_formatted_block(block: str) -> Dict[str, Any]:
     """
     Парсит наш фиксированный формат текстового отчёта в структуру.
@@ -26,13 +81,28 @@ def parse_formatted_block(block: str) -> Dict[str, Any]:
         data["portion_g"] = int(m.group(1)); data["confidence"] = int(m.group(2))
 
     # Калории
-    m = re.search(r"Калории:\s*(\d+)\s*ккал", block)
-    if m: data["kcal"] = int(m.group(1))
+    m = re.search(r"Калории:\s*([\d.,]+)\s*ккал", block, re.IGNORECASE)
+    if m:
+        k = _num_from_text(m.group(1))
+        if k is not None:
+            data["kcal"] = int(round(k))
 
     # БЖУ
-    m = re.search(r"БЖУ:\s*белки\s*([\d]+)\s*г\s*·\s*жиры\s*([\d]+)\s*г\s*·\s*углеводы\s*([\d]+)\s*г", block)
+    m = re.search(
+        r"БЖУ:\s*белки\s*([\d.,]+)\s*г\s*[·•]\s*жиры\s*([\d.,]+)\s*г\s*[·•]\s*углеводы\s*([\d.,]+)\s*г",
+        block,
+        re.IGNORECASE,
+    )
     if m:
-        data["protein_g"] = int(m.group(1)); data["fat_g"] = int(m.group(2)); data["carbs_g"] = int(m.group(3))
+        p = _num_from_text(m.group(1))
+        f = _num_from_text(m.group(2))
+        c = _num_from_text(m.group(3))
+        if p is not None:
+            data["protein_g"] = int(round(p))
+        if f is not None:
+            data["fat_g"] = int(round(f))
+        if c is not None:
+            data["carbs_g"] = int(round(c))
 
     # Расширенный разбор жиров (если присутствует в блоке)
     # Примеры ожидаемых строк:
@@ -115,4 +185,5 @@ def parse_formatted_block(block: str) -> Dict[str, Any]:
             assum.append(line.strip()[2:])
     data["assumptions"] = assum
 
+    _ensure_macros_estimated(data)
     return data
