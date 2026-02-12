@@ -674,21 +674,31 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     try:
+        post_to_chat = False
+        user = query.from_user
+        user_label = user.full_name or str(user.id)
+        if user.username:
+            user_label += f" (@{user.username})"
         if data == MENU_CB_HELP:
             text = INSTRUCTION_TEXT
         elif data == MENU_CB_ABOUT:
             text = ABOUT_TEXT
         elif data == MENU_CB_DAILY:
-            text = await _build_daily_text(query.from_user.id)
+            text = "👤 " + user_label + "\n" + await _build_daily_text(query.from_user.id)
+            post_to_chat = True
         elif data == MENU_CB_WEEKLY:
-            text = await _build_weekly_text(query.from_user.id)
+            text = "👤 " + user_label + "\n" + await _build_weekly_text(query.from_user.id)
+            post_to_chat = True
         else:
             text = "Неизвестный пункт меню."
     except Exception as e:
         log.exception("error building callback response", exc_info=e)
         text = "Ошибка при получении данных. Попробуйте позже."
     try:
-        await query.edit_message_text(text, reply_markup=menu_keyboard())
+        if post_to_chat and query.message:
+            await query.message.reply_text(text, reply_markup=menu_keyboard())
+        else:
+            await query.edit_message_text(text, reply_markup=menu_keyboard())
     except Exception as e:
         log.warning("edit_message_text failed: %s", e)
         try:
