@@ -18,12 +18,14 @@ from datetime import datetime, timezone, date, timedelta
 from typing import Optional
 
 from dotenv import load_dotenv
-from openai import OpenAI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 )
 import httpx
+
+# OpenAI-compatible client (OpenRouter supported via env)
+from llm_client import get_llm_client
 
 # --- Local modules for Admin integration ---
 from bot.parse_block import parse_formatted_block          # bot/parse_block.py
@@ -37,19 +39,19 @@ else:
     load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
 MODEL_VISION = os.getenv("OPENAI_VISION_MODEL", "gpt-5")
 MODEL_TEXT   = os.getenv("OPENAI_TEXT_MODEL",   "gpt-5")
 
 if not TELEGRAM_TOKEN or not OPENAI_KEY:
-    raise SystemExit("Set TELEGRAM_BOT_TOKEN and OPENAI_API_KEY in .env")
+    raise SystemExit("Set TELEGRAM_BOT_TOKEN and OPENROUTER_API_KEY (or OPENAI_API_KEY) in .env")
 
 # ------------- LOGGING -------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("foodbot")
 
 # ------------- OPENAI -------------
-client = OpenAI(api_key=OPENAI_KEY)
+client = get_llm_client()
 
 # ------------- DB (SQLite) -------------
 DB_PATH = os.path.join(os.path.dirname(__file__), "state_simple.db")
@@ -282,6 +284,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log.info("handle_photo: received update has_photo=%s", bool(update.message and update.message.photo))
     if not update.message or not update.message.photo:
         return
+    processing_msg = await update.message.reply_text("📸 Фото получено, анализирую…")
     photo = update.message.photo[-1]
     f = await photo.get_file()
     downloads_dir = os.path.join(os.path.dirname(__file__), "downloads")
@@ -294,15 +297,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         block = await llm_render_from_image(encode_image_to_data_url(local_path), caption)
     except Exception as e:
         log.exception("LLM image render failed", exc_info=e)
-        block = (
-            "🍽️ Разбор блюда (оценка по фото)\nБлюдо (ассорти).\nПорция: ~ 300 г  ·  доверие 60%\n"
-            "Калории: 360 ккал\nБЖУ: белки 15 г · жиры 15 г · углеводы 45 г\n"
-            "Ключевые микроэлементы (топ-5):\n• Клетчатка — 6 g\n• Витамин C — 30 mg\n"
-            "Флаги диеты:\n• vegetarian: нет  ·  vegan: нет\n• glutenfree: нет  ·  lactosefree: нет\n"
-            "Допущения:\n• Оценка по фото.\n• Ингредиенты и масса — приблизительно."
-        )
+        try:
+            await processing_msg.edit_text("⚠️ Не удалось распознать блюдо по фото. Попробуйте ещё раз или пришлите другое изображение.")
+        except Exception:
+            await update.message.reply_text("⚠️ Не удалось распознать блюдо по фото. Попробуйте ещё раз или пришлите другое изображение.")
+        return
 
-    sent = await update.message.reply_text(block)
+    try:
+        await processing_msg.edit_text(block)
+        sent = processing_msg
+    except Exception:
+        sent = await update.message.reply_text(block)
 
     # --- Admin ingestion ---
     _send_ingest_from_block(
@@ -516,12 +521,14 @@ async def _build_daily_text(telegram_user_id: int) -> str:
             return txt
         return "Нет данных за сегодня."
     today_iso = date.today().isoformat()
+    # Ищем только запись за сегодня; не подставляем "последнюю",
+    # иначе получаются некорректные итоги "за сегодня".
     row_today = None
     for r in data:
         if r.get("period_start", "").startswith(today_iso):
             row_today = r; break
     if not row_today:
-        row_today = data[-1]
+        return "Нет данных за сегодня."
     return "📊 Сводка за сегодня (" + row_today.get("period_start", '')[:10] + ")\n" + _fmt_macros(row_today.get("kcal"), row_today.get("protein_g"), row_today.get("fat_g"), row_today.get("carbs_g"))
 
 async def _build_weekly_text(telegram_user_id: int) -> str:
@@ -537,6 +544,8 @@ async def _build_weekly_text(telegram_user_id: int) -> str:
         if txt:
             return txt
         return "Нет данных за неделю."
+    row = data[-1]
+    return "📆 Сводка за неделю (начало " + row.get("period_start", '')[:10] + ")\n" + _fmt_macros(row.get("kcal"), row.get("protein_g"), row.get("fat_g"), row.get("carbs_g"))
 
 def _sum_local_for_period(telegram_user_id: int, start_utc: datetime, end_utc: datetime):
     try:
@@ -585,8 +594,6 @@ def _weekly_local_summary_text(telegram_user_id: int) -> str | None:
     if kcal <= 0 and p <= 0 and f <= 0 and carb <= 0:
         return None
     return "📆 Сводка за неделю (начало " + start.date().isoformat() + ")\n" + _fmt_macros(kcal, p, f, carb)
-    row = data[-1]
-    return "📆 Сводка за неделю (начало " + row.get("period_start", '')[:10] + ")\n" + _fmt_macros(row.get("kcal"), row.get("protein_g"), row.get("fat_g"), row.get("carbs_g"))
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
