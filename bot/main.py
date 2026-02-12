@@ -482,6 +482,18 @@ async def _fetch_summary(client_id: int, kind: str):
     except Exception:
         return []
 
+async def _fetch_meals(client_id: int):
+    base = os.getenv('ADMIN_API_BASE', 'http://localhost:8000')
+    url = f"{base}/clients/{client_id}/meals"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client_http:
+            r = await client_http.get(url)
+            if r.status_code != 200:
+                return []
+            return r.json() or []
+    except Exception:
+        return []
+
 def _fmt_macros(kcal, p, f, c):
     def _n(v):
         try:
@@ -513,7 +525,14 @@ async def _build_daily_text(telegram_user_id: int) -> str:
             row_today = r; break
     if not row_today:
         return "Нет данных за сегодня."
-    return "📊 Сводка за сегодня (" + row_today.get("period_start", '')[:10] + ")\n" + _fmt_macros(row_today.get("kcal"), row_today.get("protein_g"), row_today.get("fat_g"), row_today.get("carbs_g"))
+    meals = await _fetch_meals(client_id)
+    meals_count = sum(1 for m in meals if str(m.get("captured_at", "")).startswith(today_iso))
+    tail = f"\nУчтено блюд: {meals_count}" if meals_count > 0 else ""
+    return (
+        "📊 Сводка за сегодня (" + row_today.get("period_start", '')[:10] + ")\n"
+        + _fmt_macros(row_today.get("kcal"), row_today.get("protein_g"), row_today.get("fat_g"), row_today.get("carbs_g"))
+        + tail
+    )
 
 async def _build_weekly_text(telegram_user_id: int) -> str:
     client_id = await _fetch_client_id(telegram_user_id)
