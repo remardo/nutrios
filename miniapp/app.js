@@ -29,6 +29,15 @@
 
   function pct(v){ if (v==null) return '-'; return (v>=100?`<span class="ok">${v}%</span>`:(v>=80?`${v}%`:`<span class="warn">${v}%</span>`)); }
 
+  function escapeHtml(value){
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
   async function resolveClient(){
     const uid = userIdFromTG();
     if (!uid) throw new Error('Не найден Telegram user id');
@@ -86,6 +95,82 @@
     try { renderWeeklyChart(rows); } catch(e) {}
   }
 
+  function isBadgeUnlocked(badge){
+    if (!badge || typeof badge !== 'object') return false;
+    if ('unlocked' in badge) return Boolean(badge.unlocked);
+    if ('earned' in badge) return Boolean(badge.earned);
+    if ('achieved' in badge) return Boolean(badge.achieved);
+    if ('obtained' in badge) return Boolean(badge.obtained);
+    if ('locked' in badge) return badge.locked === false;
+    if ('status' in badge){
+      const status = String(badge.status).toLowerCase();
+      return ['unlocked','achieved','completed','active','earned','available'].includes(status);
+    }
+    if ('unlocked_at' in badge) return Boolean(badge.unlocked_at);
+    if ('completed_at' in badge) return Boolean(badge.completed_at);
+    return false;
+  }
+
+  async function loadBadges(){
+    const card = document.getElementById('badgesCard');
+    const container = document.getElementById('badges');
+    const progressEl = document.getElementById('badgesProgress');
+    if (!card || !container) return;
+
+    const raw = await fetchJSON(`/clients/${clientId}/badges`);
+    const list = Array.isArray(raw)
+      ? raw
+      : (Array.isArray(raw?.badges) ? raw.badges : (Array.isArray(raw?.items) ? raw.items : []));
+
+    if (!list.length){
+      if (progressEl){
+        progressEl.textContent = '';
+        progressEl.classList.add('empty');
+      }
+      card.classList.add('hidden');
+      container.innerHTML = '';
+      return;
+    }
+
+    const sorted = list.slice().sort((a, b) => Number(isBadgeUnlocked(b)) - Number(isBadgeUnlocked(a)));
+
+    let unlockedCount = 0;
+    const totalCount = (() => {
+      const progress = raw?.progress;
+      if (progress && typeof progress === 'object'){
+        const unlocked = Number(progress.unlocked ?? progress.current ?? progress.achieved ?? progress.completed ?? progress.done ?? 0);
+        const total = Number(progress.total ?? progress.available ?? progress.required ?? progress.count ?? 0);
+        if (total > 0){
+          unlockedCount = isNaN(unlocked) ? 0 : Math.max(0, Math.min(total, unlocked));
+          return total;
+        }
+      }
+      unlockedCount = sorted.filter(isBadgeUnlocked).length;
+      return sorted.length;
+    })();
+
+    if (progressEl){
+      progressEl.textContent = `${unlockedCount}/${totalCount}`;
+      progressEl.classList.toggle('empty', unlockedCount === 0);
+    }
+
+    container.innerHTML = sorted.map(badge => {
+      const unlocked = isBadgeUnlocked(badge);
+      const classes = `badge ${unlocked ? 'badge-unlocked' : 'badge-locked'}`;
+      const icon = badge?.icon ?? badge?.emoji ?? '🏅';
+      const title = badge?.title ?? badge?.name ?? badge?.label ?? badge?.code ?? 'Бейдж';
+      const description = badge?.description ?? badge?.text ?? '';
+      const requirement = !unlocked ? (badge?.requirement ?? badge?.hint ?? '') : '';
+      const badgeProgress = badge?.progress_text ?? badge?.progress ?? ((badge?.current != null && badge?.total != null) ? `${badge.current}/${badge.total}` : '');
+      const details = [description, requirement, badgeProgress].filter(Boolean)
+        .map(text => `<div class="badge-desc">${escapeHtml(text)}</div>`)
+        .join('');
+      return `<div class="${classes}"><div class="badge-icon">${escapeHtml(icon)}</div><div class="badge-body"><div class="badge-title">${escapeHtml(title)}</div>${details}</div></div>`;
+    }).join('');
+
+    card.classList.remove('hidden');
+  }
+
   async function loadStreak(){
     const s = await fetchJSON(`/clients/${clientId}/streak`);
     const el = document.getElementById('streak');
@@ -120,6 +205,20 @@
       await loadTargets();
       await loadDaily();
       await loadWeekly();
+      try {
+        await loadBadges();
+      } catch(e) {
+        const card = document.getElementById('badgesCard');
+        if (card) card.classList.add('hidden');
+        const container = document.getElementById('badges');
+        if (container) container.innerHTML = '';
+        const progressEl = document.getElementById('badgesProgress');
+        if (progressEl){
+          progressEl.textContent = '';
+          progressEl.classList.add('empty');
+        }
+        console.warn('Не удалось загрузить бейджи', e);
+      }
       await loadStreak();
       await loadTips();
     }catch(e){
