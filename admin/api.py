@@ -1,23 +1,22 @@
-import os, hmac, hashlib, json
-from math import isclose
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
+import os, hmac, hashlib, json, time
+from math import isclose, isfinite
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+import pandas as pd
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-from typing import Any
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
-from pathlib import Path
 
 from .ab_service import ABFlagService, ABFlagServiceError, get_ab_service
 from .analysis import df_meals, micro_top, summary_extras, summary_macros
 from .auth import AdminIdentity, require_api_key, require_roles
-from .db import SessionLocal, ensure_meals_extras_column, init_db
+from .db import SessionLocal, ensure_meals_extras_column, ensure_clients_assigned_to_column, init_db
 from .models import (
     Base,
     Client,
@@ -54,7 +53,62 @@ except Exception:
     pass
 init_db(Base)
 ensure_meals_extras_column()
+ensure_clients_assigned_to_column()
 # NOTE: We will serve SPA at root from a separate root app, see bottom of file.
+
+
+def _parse_allowed_origins(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+DEFAULT_ALLOWED_ORIGINS = ["http://localhost:19006"]
+ALLOWED_ORIGINS = _parse_allowed_origins(os.getenv("ADMIN_ALLOWED_ORIGINS")) or DEFAULT_ALLOWED_ORIGINS
+MEDIA_TOKEN_SECRET = os.getenv("MEDIA_TOKEN_SECRET")
+if not MEDIA_TOKEN_SECRET:
+    raise RuntimeError("MEDIA_TOKEN_SECRET must be configured")
+MEDIA_TOKEN_TTL_SECONDS = int(os.getenv("MEDIA_TOKEN_TTL_SECONDS", "3600"))
+
+
+def _media_signature(path: str, expires: int) -> str:
+    payload = f"{path}:{expires}".encode()
+    return hmac.new(MEDIA_TOKEN_SECRET.encode(), msg=payload, digestmod=hashlib.sha256).hexdigest()
+
+
+def _is_within_directory(base: Path, target: Path) -> bool:
+    try:
+        base_resolved = base.resolve()
+        target_resolved = target.resolve()
+        return str(target_resolved).startswith(str(base_resolved))
+    except Exception:
+        return False
+
+
+def _connect_src_value() -> str:
+    entries = ["'self'"] + ALLOWED_ORIGINS
+    return " ".join(entries)
+
+
+def _media_relative_path(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    path = raw.split("?", 1)[0]
+    if path.startswith("/media/"):
+        path = path[len("/media/"):]
+    return path.lstrip("/")
+
+
+def _build_media_url(relative_path: str | None) -> str | None:
+    if not relative_path:
+        return None
+    expires = int(time.time()) + MEDIA_TOKEN_TTL_SECONDS
+    token = _media_signature(relative_path, expires)
+    return f"/media/{relative_path}?expires={expires}&token={token}"
+
+
+def _signed_media_path(raw: str | None) -> str | None:
+    return _build_media_url(_media_relative_path(raw))
 
 # -----------------------------
 # BFF (Backend-For-Frontend) for NutriTracker-Pro web
@@ -88,7 +142,12 @@ def _resolve_client_id(
 
 
 @app.get("/ntp/user")
-def ntp_user(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
+def ntp_user(
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> dict:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     row = db.query(Client).filter_by(id=client_id).first()
     return {
@@ -99,7 +158,12 @@ def ntp_user(cid: int | None = None, tg: int | None = None, db: Session = Depend
 
 
 @app.get("/ntp/goals")
-def ntp_goals(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
+def ntp_goals(
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> dict:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     data = get_targets(client_id, db)
     try:
@@ -128,6 +192,7 @@ def ntp_put_goals(
     cid: int | None = None,
     tg: int | None = None,
     db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
 ) -> dict:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     # Normalise incoming fields
@@ -141,25 +206,45 @@ def ntp_put_goals(
 
 
 @app.get("/ntp/progress/daily")
-def ntp_progress_daily(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def ntp_progress_daily(
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> list[dict[str, Any]]:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     return daily_summary(client_id, db)
 
 
 @app.get("/ntp/progress/weekly")
-def ntp_progress_weekly(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def ntp_progress_weekly(
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> list[dict[str, Any]]:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     return weekly_summary(client_id, db)
 
 
 @app.get("/ntp/streak")
-def ntp_streak(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
+def ntp_streak(
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> dict:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     return get_streak(client_id, db)  # type: ignore[name-defined]
 
 
 @app.get("/ntp/tips")
-def ntp_tips(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
+def ntp_tips(
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> dict:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     return tips_today(client_id, db)
 
@@ -207,6 +292,7 @@ def ntp_add_meal(
     cid: int | None = None,
     tg: int | None = None,
     db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
 ) -> dict:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     title = payload.title or "Meal"
@@ -240,11 +326,12 @@ def ntp_add_meal(
         assumptions=[],
         extras=None,
         source_type=payload.source_type or "web",
-        image_path=image_url_val,
+        image_path=_media_relative_path(image_url_val),
     )
     db.add(row)
     db.commit()
     db.refresh(row)
+    signed_media = _signed_media_path(row.image_path)
     return {"ok": True, "meal": {
         "id": row.id,
         "captured_at": row.captured_at.isoformat(),
@@ -254,8 +341,8 @@ def ntp_add_meal(
         "protein_g": row.protein_g,
         "fat_g": row.fat_g,
         "carbs_g": row.carbs_g,
-        "image_path": row.image_path,
-        "photo": row.image_path,
+        "image_path": signed_media,
+        "photo": signed_media,
     }}
 
 
@@ -265,25 +352,30 @@ def ntp_list_meals(
     tg: int | None = None,
     limit: int = 50,
     db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
 ) -> list[dict[str, Any]]:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     q = db.query(Meal).filter(Meal.client_id == client_id).order_by(Meal.captured_at.desc())
     if limit:
         q = q.limit(int(limit))
     rows = q.all()
-    return [{
-        "id": r.id,
-        "captured_at": r.captured_at.isoformat(),
-        "title": r.title,
-        "portion_g": r.portion_g,
-        "kcal": r.kcal,
-        "protein_g": r.protein_g,
-        "fat_g": r.fat_g,
-        "carbs_g": r.carbs_g,
-        "image_path": r.image_path,
-        "photo": r.image_path,
-        "source_type": r.source_type,
-    } for r in rows]
+    result = []
+    for r in rows:
+        signed_media = _signed_media_path(r.image_path)
+        result.append({
+            "id": r.id,
+            "captured_at": r.captured_at.isoformat(),
+            "title": r.title,
+            "portion_g": r.portion_g,
+            "kcal": r.kcal,
+            "protein_g": r.protein_g,
+            "fat_g": r.fat_g,
+            "carbs_g": r.carbs_g,
+            "image_path": signed_media,
+            "photo": signed_media,
+            "source_type": r.source_type,
+        })
+    return result
 
 
 class NTPMealPatch(BaseModel):
@@ -304,6 +396,7 @@ def ntp_update_meal(
     cid: int | None = None,
     tg: int | None = None,
     db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
 ) -> dict:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     meal = db.query(Meal).filter(Meal.id == meal_id, Meal.client_id == client_id).first()
@@ -314,128 +407,334 @@ def ntp_update_meal(
         if value is not None:
             setattr(meal, field, value)
     if payload.image_url is not None or payload.image_path is not None:
-        meal.image_path = payload.image_url or payload.image_path
+        meal.image_path = _media_relative_path(payload.image_url or payload.image_path)
     db.commit()
     db.refresh(meal)
     return {"ok": True}
 
 
 @app.get("/ntp/day/quality")
-def ntp_day_quality(cid: int | None = None, tg: int | None = None, db: Session = Depends(get_db)) -> dict:
-    """Return today's daily quality summary for mini app (BFF).
-    Includes kcal, macros grams and percents, saturated fat %, fiber, omega ratio,
-    and counts for crucifers, heme/non-heme iron and antioxidants mentions.
-    """
+def ntp_day_quality(
+    cid: int | None = None,
+    tg: int | None = None,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> dict:
+    """Return lightweight nutrition quality summary for the current day."""
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
-    from datetime import date as _date
 
-    # Macros daily summary
+    today = date.today()
     df = df_meals(db, client_id)
-    agg = summary_macros(df, freq="D")
-    today = _date.today()
-    kcal = p_g = f_g = c_g = 0.0
-    if agg is not None and not getattr(agg, "empty", True):
-        try:
-            row = agg[agg["captured_at"].dt.date == today]
-            if row is None or row.empty:
-                row = agg.iloc[[-1]]
-            row0 = row.iloc[0]
-            kcal = float(row0["kcal"] or 0.0)
-            p_g = float(row0["protein_g"] or 0.0)
-            f_g = float(row0["fat_g"] or 0.0)
-            c_g = float(row0["carbs_g"] or 0.0)
-        except Exception:
-            pass
+    macros_df = summary_macros(df, freq="D")
+    targets = get_targets(client_id, db)
 
-    def _pct(val_kcal: float, total_kcal: float) -> float | None:
-        try:
-            return float((val_kcal / total_kcal) * 100.0) if total_kcal > 0 else None
-        except Exception:
-            return None
+    kcal = protein_g = fat_g = carbs_g = 0.0
+    protein_pct = fat_pct = carbs_pct = None
 
-    p_pct = _pct(p_g * 4.0, kcal)
-    f_pct = _pct(f_g * 9.0, kcal)
-    c_pct = _pct(c_g * 4.0, kcal)
+    if isinstance(macros_df, pd.DataFrame) and not macros_df.empty:
+        macros_df = macros_df.copy()
+        macros_df["captured_at"] = pd.to_datetime(macros_df["captured_at"], errors="coerce")
+        row = macros_df[macros_df["captured_at"].dt.date == today]
+        if row.empty:
+            row = macros_df.tail(1)
+        rec = row.iloc[0]
+        kcal = _to_float(rec.get("kcal")) or 0.0
+        protein_g = _to_float(rec.get("protein_g")) or 0.0
+        fat_g = _to_float(rec.get("fat_g")) or 0.0
+        carbs_g = _to_float(rec.get("carbs_g")) or 0.0
+        protein_pct = _percent(protein_g * 4.0, targets.get("protein_target_g"))
+        fat_pct = _percent(fat_g * 9.0, targets.get("fat_target_g"))
+        carbs_pct = _percent(carbs_g * 4.0, targets.get("carbs_target_g"))
 
-    # Extras daily: saturated, fiber, omega
-    ex = summary_extras(df, freq="D")
-    sat_pct = None
-    fiber_total = None
-    omega_ratio = None
-    if ex is not None and not getattr(ex, "empty", True):
-        try:
-            row = ex[ex["captured_at"].dt.date == today]
-            if row is None or row.empty:
-                row = ex.iloc[[-1]]
-            row0 = row.iloc[0]
-            sat_g = row0.get("fats_saturated")
-            fiber_total = float(row0.get("fiber_total")) if row0.get("fiber_total") is not None else None
-            omega_ratio = float(row0.get("omega_ratio_num")) if row0.get("omega_ratio_num") is not None else None
-            if sat_g is not None and kcal > 0:
-                sat_pct = float(sat_g) * 9.0 / float(kcal) * 100.0
-        except Exception:
-            pass
+    extras_df = summary_extras(df, freq="D")
+    fats_saturated_pct = fiber_total = omega_ratio = None
+    crucifers = heme_cnt = nonheme_cnt = antiox = 0
 
-    # Counts from meals: crucifers, iron, antioxidants
-    crucifer_meals = heme_cnt = nonheme_cnt = antiox_mentions = 0
-    try:
-        if df is not None and not getattr(df, "empty", True):
-            day = df[df["captured_at"].dt.date == today]
-            crucifer_kw = {
-                "брокколи","цветная капуста","капуста","брюссельская","кейл","листовая капуста","пекинская капуста","пак-чой","пак чой","кольраби","редис","редька","руккола","кресс",
-                "broccoli","cauliflower","cabbage","brussels","kale","bok choy","pak choi","collard","kohlrabi","radish","arugula","rocket","mustard greens","turnip greens","watercress",
-            }
-            meat_fish_kw = {
-                "говядина","телятина","свинина","баранина","печень","сердце","курица","индейка","утка","рыба","семга","лосось","тунец","сардина","печень трески",
-                "beef","veal","pork","lamb","liver","offal","chicken","turkey","duck","fish","salmon","tuna","sardine","cod liver","steak",
-            }
-            antioxidants_kw = {
-                "витамин c","аскорбиновая","витамин е","токоферол","каротиноиды","бета-каротин","ликопин","лютеин","зеаксантин","селен","полифенолы","флавоноиды","ресвератрол","кверцетин","антоцианы","катехины",
-                "vitamin c","ascorbic","vitamin e","tocopherol","carotenoids","beta-carotene","lycopene","lutein","zeaxanthin","selenium","polyphenols","flavonoids","resveratrol","quercetin","anthocyanins","catechins",
-            }
-            for _, r in day.iterrows():
-                title = str(r.get("title") or "").lower()
-                if any(k in title for k in crucifer_kw):
-                    crucifer_meals += 1
-                micro = [str(x).lower() for x in (r.get("micronutrients") or []) if x]
-                # iron detection
-                has_iron = any((("железо" in x) or ("iron" in x)) for x in micro)
-                if has_iron:
-                    flags = r.get("flags") or {}
-                    is_veg = bool(flags.get("vegan") or flags.get("vegetarian"))
-                    if any(k in title for k in meat_fish_kw) and not is_veg:
-                        heme_cnt += 1
-                    else:
-                        nonheme_cnt += 1
-                antiox_mentions += sum(1 for x in micro if any(k in x for k in antioxidants_kw))
-    except Exception:
-        pass
+    if isinstance(extras_df, pd.DataFrame) and not extras_df.empty:
+        extras_df = extras_df.copy()
+        extras_df["captured_at"] = pd.to_datetime(extras_df["captured_at"], errors="coerce")
+        row = extras_df[extras_df["captured_at"].dt.date == today]
+        if row.empty:
+            row = extras_df.tail(1)
+        rec = row.iloc[0]
+        fats_saturated = _to_float(rec.get("fats_saturated"))
+        kcal_for_pct = kcal if kcal > 0 else _to_float(rec.get("kcal")) or kcal
+        if fats_saturated is not None and kcal_for_pct:
+            fats_saturated_pct = round((fats_saturated * 9.0) / float(kcal_for_pct) * 100.0, 1)
+        fiber_total = _to_float(rec.get("fiber_total"))
+        omega_ratio = _to_float(rec.get("omega_ratio_num"))
+
+    if not df.empty:
+        df_all = df.copy()
+        df_all["captured_at"] = pd.to_datetime(df_all["captured_at"], errors="coerce")
+        today_meals = df_all[df_all["captured_at"].dt.date == today]
+        crucifer_kw = {"брокколи", "цветная капуста", "капуста", "brussels", "kale"}
+        heme_kw = {"говядина", "телятина", "печень", "рыба", "beef", "liver", "salmon"}
+        for _, meal in today_meals.iterrows():
+            title = str(meal.get("title") or "").lower()
+            if any(word in title for word in crucifer_kw):
+                crucifers += 1
+            micros = [str(x).lower() for x in (meal.get("micronutrients") or [])]
+            antiox += sum(1 for x in micros if "антиокс" in x or "antiox" in x)
+            if any("железо" in x or "iron" in x for x in micros):
+                if any(word in title for word in heme_kw):
+                    heme_cnt += 1
+                else:
+                    nonheme_cnt += 1
 
     return {
-        "date": today.isoformat(),
-        "kcal": round(kcal, 0),
-        "protein_g": round(p_g, 1),
-        "fat_g": round(f_g, 1),
-        "carbs_g": round(c_g, 1),
-        "p_pct": None if p_pct is None else round(p_pct, 1),
-        "f_pct": None if f_pct is None else round(f_pct, 1),
-        "c_pct": None if c_pct is None else round(c_pct, 1),
-        "sat_pct": None if sat_pct is None else round(sat_pct, 1),
+        "kcal": round(kcal, 1),
+        "protein_g": round(protein_g, 1),
+        "fat_g": round(fat_g, 1),
+        "carbs_g": round(carbs_g, 1),
+        "protein_pct": protein_pct,
+        "fat_pct": fat_pct,
+        "carbs_pct": carbs_pct,
+        "fats_saturated_pct": fats_saturated_pct,
         "fiber_total": fiber_total,
         "omega_ratio": omega_ratio,
-        "crucifer_meals": crucifer_meals,
+        "crucifer_meals": crucifers,
         "heme_iron_meals": heme_cnt,
         "nonheme_iron_meals": nonheme_cnt,
-        "antioxidants_mentions": antiox_mentions,
+        "antioxidants_mentions": antiox,
     }
 
 
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        result = float(value)
+        return result if isfinite(result) else None
+    except Exception:
+        return None
+
+
+def _to_int(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return int(value)
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _to_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    try:
+        if pd.isna(value):
+            return []
+    except Exception:
+        pass
+    return [value]
+
+
+def _percent(value: Optional[float], target: Optional[float]) -> Optional[float]:
+    try:
+        if value is None or target is None or target <= 0:
+            return None
+        return round(float(value) / float(target) * 100.0, 1)
+    except Exception:
+        return None
+
+
+def _prepare_summary_frame(df: Any) -> pd.DataFrame:
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        renamed = df.rename(columns={"captured_at": "period_start"}).copy()
+        renamed["period_start"] = pd.to_datetime(renamed["period_start"], errors="coerce")
+        return renamed
+    return pd.DataFrame()
+
+
+def _select_period_row(df: pd.DataFrame, target_date: Optional[date] = None) -> Optional[pd.Series]:
+    if df.empty:
+        return None
+    ordered = df.sort_values("period_start")
+    if target_date is not None:
+        mask = ordered["period_start"].dt.date == target_date
+        if mask.any():
+            return ordered.loc[mask].iloc[-1]
+    return ordered.iloc[-1]
+
+
+def _format_macro_block(row: Optional[pd.Series], targets: dict[str, Any]) -> dict[str, Any]:
+    if row is None:
+        return {
+            "date": None,
+            "kcal": 0.0,
+            "protein_g": 0.0,
+            "fat_g": 0.0,
+            "carbs_g": 0.0,
+            "protein_pct": None,
+            "fat_pct": None,
+            "carbs_pct": None,
+        }
+    kcal = _to_float(row.get("kcal")) or 0.0
+    protein = _to_float(row.get("protein_g")) or 0.0
+    fat = _to_float(row.get("fat_g")) or 0.0
+    carbs = _to_float(row.get("carbs_g")) or 0.0
+    return {
+        "date": row.get("period_start").date().isoformat() if row.get("period_start") is not None else None,
+        "kcal": kcal,
+        "protein_g": protein,
+        "fat_g": fat,
+        "carbs_g": carbs,
+        "protein_pct": _percent(protein * 4.0, targets.get("protein_target_g")),
+        "fat_pct": _percent(fat * 9.0, targets.get("fat_target_g")),
+        "carbs_pct": _percent(carbs * 4.0, targets.get("carbs_target_g")),
+    }
+
+
+def _saturated_percent(extras_row: pd.Series, kcal: float) -> Optional[float]:
+    if kcal <= 0:
+        return None
+    sat = _to_float(extras_row.get("fats_saturated"))
+    if sat is None:
+        return None
+    return round((sat * 9.0) / kcal * 100.0, 1)
+
+
+def build_dashboard_payload(client_id: int, db: Session) -> dict[str, Any]:
+    df = df_meals(db, client_id)
+    targets = get_targets(client_id, db)
+    if not targets:
+        targets = {
+            "kcal_target": 2000,
+            "protein_target_g": 100,
+            "fat_target_g": 70,
+            "carbs_target_g": 250,
+        }
+
+    daily_df = _prepare_summary_frame(summary_macros(df, freq="D"))
+    weekly_df = _prepare_summary_frame(summary_macros(df, freq="W"))
+    extras_df = _prepare_summary_frame(summary_extras(df, freq="D"))
+
+    today = date.today()
+    daily_row = _select_period_row(daily_df, today)
+    weekly_row = _select_period_row(weekly_df)
+    extras_row = _select_period_row(extras_df, today)
+
+    daily_block = _format_macro_block(daily_row, targets)
+    weekly_block = _format_macro_block(weekly_row, targets)
+
+    if extras_row is not None:
+        daily_block.update(
+            {
+                "fats_saturated_pct": _saturated_percent(extras_row, daily_block["kcal"]),
+                "fiber_total": _to_float(extras_row.get("fiber_total")),
+                "omega_ratio": _to_float(extras_row.get("omega_ratio_num")),
+            }
+        )
+    else:
+        daily_block.update({"fats_saturated_pct": None, "fiber_total": None, "omega_ratio": None})
+
+    daily_trend = [
+        {
+            "period": row["period_start"].date().isoformat(),
+            "kcal": _to_float(row.get("kcal")) or 0.0,
+            "protein_g": _to_float(row.get("protein_g")) or 0.0,
+            "fat_g": _to_float(row.get("fat_g")) or 0.0,
+            "carbs_g": _to_float(row.get("carbs_g")) or 0.0,
+        }
+        for _, row in daily_df.iterrows()
+    ]
+
+    weekly_trend = [
+        {
+            "period": row["period_start"].date().isoformat(),
+            "kcal": _to_float(row.get("kcal")) or 0.0,
+            "protein_g": _to_float(row.get("protein_g")) or 0.0,
+            "fat_g": _to_float(row.get("fat_g")) or 0.0,
+            "carbs_g": _to_float(row.get("carbs_g")) or 0.0,
+        }
+        for _, row in weekly_df.iterrows()
+    ]
+
+    recent_meals: list[dict[str, Any]] = []
+    if not df.empty:
+        recent = df.sort_values("captured_at", ascending=False).head(50)
+        for _, row in recent.iterrows():
+            captured = row.get("captured_at")
+            recent_meals.append(
+                {
+                    "id": int(row.get("meal_id")) if row.get("meal_id") is not None else None,
+                    "captured_at": captured.isoformat() if pd.notna(captured) else None,
+                    "title": row.get("title"),
+                    "portion_g": _to_float(row.get("portion_g")),
+                    "confidence": _to_int(row.get("confidence")),
+                    "kcal": _to_float(row.get("kcal")),
+                    "protein_g": _to_float(row.get("protein_g")),
+                    "fat_g": _to_float(row.get("fat_g")),
+                    "carbs_g": _to_float(row.get("carbs_g")),
+                    "image_path": row.get("image_path"),
+                    "source_type": row.get("source_type"),
+                    "flags": row.get("flags") or {},
+                    "micronutrients": _to_list(row.get("micronutrients")),
+                    "assumptions": _to_list(row.get("assumptions")),
+                    "special_groups": row.get("special_groups") or {},
+                }
+            )
+
+    streak_data = compliance_streak(client_id, db)
+    tips_data = tips_today(client_id, db)
+
+    return {
+        "targets": targets,
+        "daily": daily_block,
+        "weekly": weekly_block,
+        "daily_trend": daily_trend,
+        "weekly_trend": weekly_trend,
+        "meals": recent_meals,
+        "streak": streak_data,
+        "tips": tips_data.get("tips", []) if isinstance(tips_data, dict) else [],
+    }
+
+
+@app.get("/clients/{client_id}/dashboard")
+def client_dashboard(
+    client_id: int,
+    db: Session = Depends(get_db),
+    identity: AdminIdentity = Depends(require_api_key),
+) -> dict:
+    if "nutritionist" in identity.roles and identity.subject:
+        c = db.query(Client).filter_by(id=client_id).first()
+        if not c:
+            raise HTTPException(status_code=404, detail="client not found")
+        if (c.assigned_to or None) != identity.subject:
+            raise HTTPException(status_code=403, detail="forbidden")
+    return build_dashboard_payload(client_id, db)
+
+class AssignClientPayload(BaseModel):
+    assigned_to: Optional[str] = None
+
+@app.put("/clients/{client_id}/assign", dependencies=[Depends(require_roles("admin"))])
+def assign_client(
+    client_id: int,
+    payload: AssignClientPayload,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> dict:
+    c = db.query(Client).filter_by(id=client_id).first()
+    if not c:
+        raise HTTPException(status_code=404, detail="client not found")
+    value = (payload.assigned_to or "").strip()
+    c.assigned_to = value or None
+    db.commit()
+    return {"ok": True, "client_id": c.id, "assigned_to": c.assigned_to}
 @app.delete("/ntp/meals/{meal_id}")
 def ntp_delete_meal(
     meal_id: int,
     cid: int | None = None,
     tg: int | None = None,
     db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
 ) -> dict:
     client_id = _resolve_client_id(db=db, cid=cid, tg=tg)
     meal = db.query(Meal).filter(Meal.id == meal_id, Meal.client_id == client_id).first()
@@ -479,6 +778,7 @@ def ingest_meal_api(payload: IngestMeal, db: Session = Depends(get_db), _=Depend
     fields.pop("message_id", None)  # Remove message_id to avoid duplicate
     fields.pop("telegram_user_id", None)  # Remove client fields
     fields.pop("telegram_username", None)
+    fields["image_path"] = _media_relative_path(fields.get("image_path"))
     if not meal:
         meal = Meal(client_id=client.id, message_id=payload.message_id, captured_at=captured_at, **fields)
         db.add(meal)
@@ -491,13 +791,38 @@ def ingest_meal_api(payload: IngestMeal, db: Session = Depends(get_db), _=Depend
 
 # ----- Lists -----
 @app.get("/clients")
-def list_clients(db: Session = Depends(get_db)):
-    rows = db.query(Client).order_by(Client.created_at.desc()).all()
-    return [{"id": r.id, "telegram_user_id": r.telegram_user_id, "telegram_username": r.telegram_username} for r in rows]
+def list_clients(
+    db: Session = Depends(get_db),
+    identity: AdminIdentity = Depends(require_api_key),
+    assigned: Optional[str] = Query(default=None),
+):
+    q = db.query(Client)
+    if "nutritionist" in identity.roles and identity.subject:
+        q = q.filter(Client.assigned_to == identity.subject)
+    else:
+        if assigned == "unassigned":
+            q = q.filter((Client.assigned_to.is_(None)) | (Client.assigned_to == ""))
+        elif assigned == "mine" and identity.subject:
+            q = q.filter(Client.assigned_to == identity.subject)
+        elif assigned:
+            q = q.filter(Client.assigned_to == assigned)
+    rows = q.order_by(Client.created_at.desc()).all()
+    return [{
+        "id": r.id,
+        "telegram_user_id": r.telegram_user_id,
+        "telegram_username": r.telegram_username,
+        "assigned_to": r.assigned_to,
+    } for r in rows]
 
 
 @app.get("/client/by_telegram/{telegram_user_id}")
-def client_by_telegram(telegram_user_id: int, db: Session = Depends(get_db), X_Telegram_Init_Data: str | None = Header(default=None), request: Request = None):
+def client_by_telegram(
+    telegram_user_id: int,
+    db: Session = Depends(get_db),
+    X_Telegram_Init_Data: str | None = Header(default=None),
+    request: Request = None,
+    _: AdminIdentity = Depends(require_api_key),
+):
     # Verify Telegram initData (production). Optional local debug is allowed only when ALLOW_DEBUG_WEBAPP is explicitly enabled.
     def _ok(uid):
         return uid == telegram_user_id
@@ -540,14 +865,18 @@ def client_by_telegram(telegram_user_id: int, db: Session = Depends(get_db), X_T
     return {"id": row.id, "telegram_user_id": row.telegram_user_id, "telegram_username": row.telegram_username}
 
 @app.get("/clients/{client_id}/meals")
-def list_meals(client_id: int, db: Session = Depends(get_db)):
+def list_meals(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+):
     rows = db.query(Meal).filter(Meal.client_id==client_id).order_by(Meal.captured_at.desc()).all()
     return [{
         "id": r.id, "captured_at": r.captured_at.isoformat(), "title": r.title, "portion_g": r.portion_g,
         "kcal": r.kcal, "protein_g": r.protein_g, "fat_g": r.fat_g, "carbs_g": r.carbs_g,
         "flags": r.flags, "micronutrients": r.micronutrients, "assumptions": r.assumptions,
         "extras": r.extras,
-        "image_path": r.image_path, "source_type": r.source_type, "message_id": r.message_id
+        "image_path": _signed_media_path(r.image_path), "source_type": r.source_type, "message_id": r.message_id
     } for r in rows]
 
 
@@ -564,7 +893,11 @@ class Targets(BaseModel):
 
 
 @app.get("/clients/{client_id}/targets")
-def get_targets(client_id: int, db: Session = Depends(get_db)):
+def get_targets(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+):
     t = db.query(ClientTargets).filter_by(client_id=client_id).first()
     if not t:
         # defaults
@@ -591,7 +924,12 @@ def get_targets(client_id: int, db: Session = Depends(get_db)):
 
 
 @app.put("/clients/{client_id}/targets")
-def put_targets(client_id: int, payload: Targets, db: Session = Depends(get_db)):
+def put_targets(
+    client_id: int,
+    payload: Targets,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+):
     t = db.query(ClientTargets).filter_by(client_id=client_id).first()
     if not t:
         t = ClientTargets(client_id=client_id)
@@ -672,12 +1010,13 @@ def _progress_rows(df, targets):
         return []
     out = []
     for _, r in df.iterrows():
+        period = r["captured_at"].to_pydatetime() if hasattr(r["captured_at"], "to_pydatetime") else r["captured_at"]
         row = {
-            "period_start": (r["captured_at"].to_pydatetime() if hasattr(r["captured_at"], "to_pydatetime") else r["captured_at"]).isoformat(),
-            "kcal": float(r["kcal"]),
-            "protein_g": float(r["protein_g"]),
-            "fat_g": float(r["fat_g"]),
-            "carbs_g": float(r["carbs_g"]),
+            "period_start": period.isoformat() if hasattr(period, "isoformat") else str(period),
+            "kcal": _to_float(r.get("kcal")) or 0.0,
+            "protein_g": _to_float(r.get("protein_g")) or 0.0,
+            "fat_g": _to_float(r.get("fat_g")) or 0.0,
+            "carbs_g": _to_float(r.get("carbs_g")) or 0.0,
         }
         if targets:
             def pct(v, t):
@@ -695,10 +1034,12 @@ def _progress_rows(df, targets):
                 if targets else None
         out.append(row)
     return out
-
-
 @app.get("/clients/{client_id}/progress/daily")
-def daily_progress(client_id: int, db: Session = Depends(get_db)):
+def daily_progress(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> list[dict[str, Any]]:
     df = df_meals(db, client_id)
     agg = summary_macros(df, freq="D")
     targets = get_targets(client_id, db)
@@ -706,7 +1047,11 @@ def daily_progress(client_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/clients/{client_id}/progress/weekly")
-def weekly_progress(client_id: int, db: Session = Depends(get_db)):
+def weekly_progress(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> list[dict[str, Any]]:
     df = df_meals(db, client_id)
     agg = summary_macros(df, freq="W")
     targets = get_targets(client_id, db)
@@ -714,33 +1059,41 @@ def weekly_progress(client_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/clients/{client_id}/streak")
-def compliance_streak(client_id: int, db: Session = Depends(get_db)):
+def compliance_streak(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+) -> dict[str, Any]:
     df = df_meals(db, client_id)
     agg = summary_macros(df, freq="D")
     if agg is None or getattr(agg, "empty", True):
         return {"streak": 0, "met_goal_7": False}
-    t = get_targets(client_id, db)
-    # Define compliance if kcal within 10% and macros within 20%
-    def is_ok(row):
+    targets = get_targets(client_id, db)
+
+    def is_ok(row: pd.Series) -> bool:
         try:
-            kcal_ok = abs(float(row["kcal"]) - t["kcal_target"]) <= t["kcal_target"] * 0.10
-            p_ok = abs(float(row["protein_g"]) - t["protein_target_g"]) <= max(10.0, t["protein_target_g"] * 0.20)
-            f_ok = abs(float(row["fat_g"]) - t["fat_target_g"]) <= max(10.0, t["fat_target_g"] * 0.20)
-            c_ok = abs(float(row["carbs_g"]) - t["carbs_target_g"]) <= max(15.0, t["carbs_target_g"] * 0.20)
-            return kcal_ok and p_ok and f_ok and c_ok
+            kcal_ok = abs(float(row["kcal"]) - targets["kcal_target"]) <= targets["kcal_target"] * 0.10
+            protein_ok = abs(float(row["protein_g"]) - targets["protein_target_g"]) <= max(
+                10.0, targets["protein_target_g"] * 0.20
+            )
+            fat_ok = abs(float(row["fat_g"]) - targets["fat_target_g"]) <= max(
+                10.0, targets["fat_target_g"] * 0.20
+            )
+            carbs_ok = abs(float(row["carbs_g"]) - targets["carbs_target_g"]) <= max(
+                15.0, targets["carbs_target_g"] * 0.20
+            )
+            return kcal_ok and protein_ok and fat_ok and carbs_ok
         except Exception:
             return False
-    # compute current streak from last day backwards
+
     streak = 0
-    for _, r in agg.sort_values("captured_at").iterrows():
-        pass
-    # iterate reverse
-    for _, r in agg.sort_values("captured_at", ascending=False).iterrows():
-        if is_ok(r):
+    for _, row in agg.sort_values("captured_at", ascending=False).iterrows():
+        if is_ok(row):
             streak += 1
         else:
             break
     return {"streak": streak, "met_goal_7": streak >= 7}
+
 
 # ----- Experiments (AB testing) -----
 
@@ -1032,7 +1385,11 @@ def resume_experiment(
 
 # ----- Tips -----
 @app.get("/clients/{client_id}/tips/today")
-def tips_today(client_id: int, db: Session = Depends(get_db)):
+def tips_today(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+):
     """Return a simple set of daily tips based on how far the user is from targets today.
     This is intentionally lightweight to support the miniapp UI.
     """
@@ -1077,19 +1434,31 @@ def tips_today(client_id: int, db: Session = Depends(get_db)):
 
 # ----- Analytics -----
 @app.get("/clients/{client_id}/summary/daily")
-def daily_summary(client_id: int, db: Session = Depends(get_db)):
+def daily_summary(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+):
     df = df_meals(db, client_id)
     agg = summary_macros(df, freq="D")
     return json_safe(agg)
 
 @app.get("/clients/{client_id}/summary/weekly")
-def weekly_summary(client_id: int, db: Session = Depends(get_db)):
+def weekly_summary(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+):
     df = df_meals(db, client_id)
     agg = summary_macros(df, freq="W")
     return json_safe(agg)
 
 @app.get("/clients/{client_id}/micro/top")
-def micro_summary(client_id: int, db: Session = Depends(get_db)):
+def micro_summary(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+):
     df = df_meals(db, client_id)
     return micro_top(df, top=10)
 
@@ -1098,10 +1467,13 @@ def json_safe(df):
         return []
     out = []
     for _, r in df.iterrows():
+        period = r["captured_at"].to_pydatetime() if hasattr(r["captured_at"], "to_pydatetime") else r["captured_at"]
         out.append({
-            "period_start": (r["captured_at"].to_pydatetime() if hasattr(r["captured_at"], "to_pydatetime") else r["captured_at"]).isoformat(),
-            "kcal": float(r["kcal"]), "protein_g": float(r["protein_g"]),
-            "fat_g": float(r["fat_g"]), "carbs_g": float(r["carbs_g"]),
+            "period_start": period.isoformat() if hasattr(period, "isoformat") else str(period),
+            "kcal": _to_float(r.get("kcal")) or 0.0,
+            "protein_g": _to_float(r.get("protein_g")) or 0.0,
+            "fat_g": _to_float(r.get("fat_g")) or 0.0,
+            "carbs_g": _to_float(r.get("carbs_g")) or 0.0,
         })
     return out
 
@@ -1117,22 +1489,28 @@ def json_safe_extras(df):
         ]:
             if k in df.columns:
                 val = r[k]
-                if val is not None:
-                    try:
-                        row[k] = float(val)
-                    except (TypeError, ValueError):
-                        pass
+                parsed = _to_float(val)
+                if parsed is not None:
+                    row[k] = parsed
         out.append(row)
     return out
 
 @app.get("/clients/{client_id}/extras/daily")
-def daily_extras(client_id: int, db: Session = Depends(get_db)):
+def daily_extras(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+):
     df = df_meals(db, client_id)
     agg = summary_extras(df, freq="D")
     return json_safe_extras(agg)
 
 @app.get("/clients/{client_id}/extras/weekly")
-def weekly_extras(client_id: int, db: Session = Depends(get_db)):
+def weekly_extras(
+    client_id: int,
+    db: Session = Depends(get_db),
+    _: AdminIdentity = Depends(require_api_key),
+):
     df = df_meals(db, client_id)
     agg = summary_extras(df, freq="W")
     return json_safe_extras(agg)
@@ -1140,7 +1518,7 @@ def weekly_extras(client_id: int, db: Session = Depends(get_db)):
 # Allow dev origins (e.g., Expo 19006) to call API during debugging (applies to API app; root app will serve SPA)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1160,7 +1538,7 @@ async def add_csp_headers(request: Request, call_next):  # type: ignore[override
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "
             "font-src 'self' data:; "
-            "connect-src 'self' *; "
+            f"connect-src {_connect_src_value()}; "
             "worker-src 'self' blob:; "
             "frame-ancestors 'self'; "
             "base-uri 'self'"
@@ -1181,10 +1559,21 @@ def _build_root_app() -> FastAPI:
     # Mount SPA (Expo export)
     base_dir = Path(__file__).resolve().parents[1]
     _dist = base_dir / "NutriTracker-Pro" / "NutriTracker-Pro-main" / "dist"
-    # Serve media (photos saved by bot) from /media
     media_dir = base_dir / "bot" / "downloads"
     if media_dir.exists():
-        root.mount("/media", StaticFiles(directory=str(media_dir), html=False), name="media")
+        @root.get("/media/{file_path:path}")
+        def _serve_media(file_path: str, token: str = Query(...), expires: int = Query(...)):
+            if expires <= 0:
+                raise HTTPException(status_code=400, detail="Invalid expiry")
+            if expires < int(time.time()):
+                raise HTTPException(status_code=410, detail="Media link expired")
+            expected = _media_signature(file_path, expires)
+            if not hmac.compare_digest(expected, token):
+                raise HTTPException(status_code=403, detail="Invalid media token")
+            target = (media_dir / file_path).resolve()
+            if not _is_within_directory(media_dir, target) or not target.exists() or not target.is_file():
+                raise HTTPException(status_code=404, detail="Media not found")
+            return FileResponse(target)
     if _dist.exists():
         # Static assets first to avoid being shadowed by catch-all
         if (_dist / "_expo").exists():
@@ -1249,7 +1638,7 @@ def _build_root_app() -> FastAPI:
                 "style-src 'self' 'unsafe-inline'; "
                 "img-src 'self' data: blob:; "
                 "font-src 'self' data:; "
-                "connect-src 'self' *; "
+                f"connect-src {_connect_src_value()}; "
                 "worker-src 'self' blob:; "
                 "frame-ancestors 'self'; "
                 "base-uri 'self'"
