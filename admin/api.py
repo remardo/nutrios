@@ -85,7 +85,10 @@ def ingest_meal_api(payload: IngestMeal, db: Session = Depends(get_db), _=Depend
     # upsert by (client_id, message_id)
     meal = db.query(Meal).filter_by(client_id=client.id, message_id=payload.message_id).first()
     fields = payload.dict()
-    captured_at = datetime.fromisoformat(fields.pop("captured_at_iso"))
+    try:
+        captured_at = datetime.fromisoformat(fields.pop("captured_at_iso"))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid captured_at_iso format")
     fields.pop("message_id", None)  # Remove message_id to avoid duplicate
     fields.pop("telegram_user_id", None)  # Remove client fields
     fields.pop("telegram_username", None)
@@ -135,7 +138,13 @@ def client_by_telegram(telegram_user_id: int, db: Session = Depends(get_db), X_T
         except Exception:
             raise HTTPException(status_code=401, detail="Invalid Telegram init data")
     elif allow_debug and request is not None and 'tg' in dict(request.query_params):
-        uid = int(dict(request.query_params)['tg'])
+        tg_param = dict(request.query_params).get("tg")
+        try:
+            uid = int(tg_param) if tg_param is not None else None
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=401, detail="Invalid debug tg parameter")
+        if uid is None:
+            raise HTTPException(status_code=401, detail="Invalid debug tg parameter")
         if not _ok(uid):
             raise HTTPException(status_code=403, detail="Forbidden")
     else:
