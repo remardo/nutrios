@@ -467,11 +467,13 @@ MENU_CB_HELP = "MENU_HELP"
 MENU_CB_ABOUT = "MENU_ABOUT"
 MENU_CB_DAILY = "MENU_DAILY"
 MENU_CB_WEEKLY = "MENU_WEEKLY"
+MENU_CB_DAILY_DETAILS = "MENU_DAILY_DETAILS"
 
 def menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📖 Инструкция", callback_data=MENU_CB_HELP), InlineKeyboardButton("ℹ️ О боте", callback_data=MENU_CB_ABOUT)],
-        [InlineKeyboardButton("📊 За сегодня", callback_data=MENU_CB_DAILY), InlineKeyboardButton("📆 За неделю", callback_data=MENU_CB_WEEKLY)]
+        [InlineKeyboardButton("📊 За сегодня", callback_data=MENU_CB_DAILY), InlineKeyboardButton("📆 За неделю", callback_data=MENU_CB_WEEKLY)],
+        [InlineKeyboardButton("🧾 За сегодня подробно", callback_data=MENU_CB_DAILY_DETAILS)],
     ])
 
 INSTRUCTION_TEXT = (
@@ -480,7 +482,7 @@ INSTRUCTION_TEXT = (
     "2. Можно описать блюдо текстом.\n"
     "3. Уточнения: сообщение со словами ‘добавь’, ‘убери’, ‘без’, ‘ещё/еще’, ‘поменяй’, ‘замени’, или ответ реплаем.\n"
     "4. /menu — показать меню.\n"
-    "5. Сводки: кнопки ‘За сегодня’ и ‘За неделю’."
+    "5. Сводки: кнопки ‘За сегодня’, ‘За неделю’ и ‘За сегодня подробно’."
 )
 
 ABOUT_TEXT = (
@@ -633,6 +635,69 @@ async def _build_weekly_text(telegram_user_id: int) -> str:
     row = data[-1]
     return "📆 Сводка за неделю (начало " + row.get("period_start", '')[:10] + ")\n" + _fmt_macros(row.get("kcal"), row.get("protein_g"), row.get("fat_g"), row.get("carbs_g"))
 
+async def _build_daily_details_text(telegram_user_id: int, chat_id: int | None = None) -> str:
+    """Краткий список блюд за сегодня: номер, дата/время, название, калории и БЖУ, порция и доверие."""
+    try:
+        start, end = _msk_day_bounds_utc()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT created_at, bot_output FROM interactions
+            WHERE chat_id=? AND created_at>=? AND created_at<?
+            ORDER BY created_at ASC
+            """,
+            ((chat_id or telegram_user_id), start.isoformat(), end.isoformat()),
+        )
+        rows = c.fetchall()
+        conn.close()
+    except Exception:
+        rows = []
+    try:
+        log.info(
+            "DAILY_DETAILS: user_id=%s chat_id=%s used_id=%s start=%s end=%s rows=%s",
+            telegram_user_id, chat_id, (chat_id or telegram_user_id), start.isoformat(), end.isoformat(), len(rows)
+        )
+    except Exception:
+        pass
+
+    if not rows:
+        return "🧾 За сегодня подробно\nСегодня ещё нет блюд."
+
+    def _num(v):
+        try:
+            return int(round(float(v or 0)))
+        except Exception:
+            return 0
+
+    lines = []
+    for idx, (created_at_iso, text) in enumerate(rows, start=1):
+        try:
+            parsed = parse_formatted_block(text)
+        except Exception:
+            continue
+        title = parsed.get("title") or "Блюдо"
+        portion = _num(parsed.get("portion_g"))
+        kcal = _num(parsed.get("kcal"))
+        p = _num(parsed.get("protein_g"))
+        f = _num(parsed.get("fat_g"))
+        carb = _num(parsed.get("carbs_g"))
+        # Доверие убираем из краткого списка.
+        try:
+            dt_local = datetime.fromisoformat(created_at_iso).astimezone()
+            dt_s = dt_local.strftime("%H:%M")
+        except Exception:
+            dt_s = created_at_iso[11:16]
+        lines.append(
+            f"{idx}. {dt_s} — {title} · ~{portion} г · {kcal} ккал · Б:{p} г Ж:{f} г У:{carb} г"
+        )
+
+    try:
+        log.info("DAILY_DETAILS: built lines=%s for used_id=%s", len(lines), (chat_id or telegram_user_id))
+    except Exception:
+        pass
+    return "🧾 За сегодня подробно\n" + "\n".join(lines)
+
 def _sum_local_for_period(telegram_user_id: int, start_utc: datetime, end_utc: datetime):
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -706,6 +771,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == MENU_CB_WEEKLY:
             text = "👤 " + user_label + "\n" + await _build_weekly_text(query.from_user.id)
             post_to_chat = True
+        elif data == MENU_CB_DAILY_DETAILS:
+            text = await _build_daily_details_text(
+                query.from_user.id,
+                chat_id=(query.message.chat_id if query.message else None),
+            )
         else:
             text = "Неизвестный пункт меню."
     except Exception as e:
