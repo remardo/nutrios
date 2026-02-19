@@ -54,6 +54,18 @@ log = logging.getLogger("foodbot")
 # ------------- OPENAI -------------
 client = get_llm_client()
 
+
+def log_llm_startup_config() -> None:
+    provider = "openrouter" if os.getenv("OPENROUTER_API_KEY") else "openai"
+    base_url = str(getattr(client, "base_url", "")) or "(default)"
+    log.info(
+        "LLM startup config: provider=%s base_url=%s vision_model=%s text_model=%s",
+        provider,
+        base_url,
+        MODEL_VISION,
+        MODEL_TEXT,
+    )
+
 # ------------- DB (SQLite) -------------
 DB_PATH = os.path.join(os.path.dirname(__file__), "state_simple.db")
 MSK = ZoneInfo("Europe/Moscow")
@@ -713,6 +725,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ------------- MAIN -------------
 def main():
     init_db()
+    log_llm_startup_config()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("finalize", finalize_command))
