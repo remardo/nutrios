@@ -332,10 +332,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await processing_msg.edit_text(block)
+        await processing_msg.edit_text(block, reply_markup=analysis_keyboard(processing_msg.message_id))
         sent = processing_msg
     except Exception:
-        sent = await update.message.reply_text(block)
+        sent = await update.message.reply_text(block, reply_markup=analysis_keyboard(processing_msg.message_id))
 
     # --- Admin ingestion ---
     ingest_info = _send_ingest_from_block(
@@ -357,6 +357,43 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
 
+    # Correction flow triggered from inline "✏️ Исправить" button.
+    forced_bot_msg_id = context.user_data.pop("force_edit_message_id", None)
+    if forced_bot_msg_id and not (
+        update.message.reply_to_message
+        and update.message.reply_to_message.from_user
+        and update.message.reply_to_message.from_user.is_bot
+    ):
+        row = get_interaction_by_bot_message_id(forced_bot_msg_id)
+        if row:
+            _, chat_id, _, bot_msg_id, mode, _, prev_block = row
+            if chat_id == update.effective_chat.id:
+                try:
+                    new_block = await llm_revise(prev_block, text)
+                except Exception as e:
+                    log.exception("LLM revise failed (forced flow)", exc_info=e)
+                    new_block = prev_block
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=bot_msg_id,
+                        text=new_block,
+                        reply_markup=analysis_keyboard(bot_msg_id),
+                    )
+                except Exception:
+                    await update.message.reply_text(new_block, reply_markup=analysis_keyboard(bot_msg_id))
+                update_interaction_bot_output(bot_msg_id, new_block)
+                ingest_info = _send_ingest_from_block(
+                    block_text=new_block,
+                    update=update,
+                    message_id=bot_msg_id,
+                    source_type=mode or "text",
+                    image_path=None,
+                )
+                if ingest_info and ingest_info.get("missing_macros"):
+                    await update.message.reply_text("⚠️ Не удалось определить БЖУ для этого блюда. Учтены только калории.")
+                return
+
     # Not a reply but likely a correction → apply to last bot message
     if not (update.message.reply_to_message and update.message.reply_to_message.from_user and update.message.reply_to_message.from_user.is_bot):
         markers = ("есть ", "добавь", "убери", "без ", "+", "ещё ", "еще ", "поменяй", "замени")
@@ -372,9 +409,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     new_block = prev_block  # fallback: keep as is
 
                 try:
-                    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=bot_msg_id, text=new_block)
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=bot_msg_id,
+                        text=new_block,
+                        reply_markup=analysis_keyboard(bot_msg_id),
+                    )
                 except Exception:
-                    await update.message.reply_text(new_block)
+                    await update.message.reply_text(new_block, reply_markup=analysis_keyboard(bot_msg_id))
 
                 update_interaction_bot_output(bot_msg_id, new_block)
 
@@ -405,10 +447,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Допущения:\n• Оценка по описанию.\n• Ингредиенты и масса — приблизительно."
         )
     try:
-        await processing_msg.edit_text(block)
+        await processing_msg.edit_text(block, reply_markup=analysis_keyboard(processing_msg.message_id))
         sent = processing_msg
     except Exception:
-        sent = await update.message.reply_text(block)
+        sent = await update.message.reply_text(block, reply_markup=analysis_keyboard(processing_msg.message_id))
 
     # Admin ingestion
     ingest_info = _send_ingest_from_block(
@@ -442,9 +484,9 @@ async def handle_correction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_block = prev_block
 
     try:
-        await msg.reply_to_message.edit_text(new_block)
+        await msg.reply_to_message.edit_text(new_block, reply_markup=analysis_keyboard(bot_msg_id))
     except Exception:
-        await msg.reply_text(new_block)
+        await msg.reply_text(new_block, reply_markup=analysis_keyboard(bot_msg_id))
 
     update_interaction_bot_output(bot_msg_id, new_block)
 
@@ -468,6 +510,13 @@ MENU_CB_ABOUT = "MENU_ABOUT"
 MENU_CB_DAILY = "MENU_DAILY"
 MENU_CB_WEEKLY = "MENU_WEEKLY"
 MENU_CB_DAILY_DETAILS = "MENU_DAILY_DETAILS"
+MENU_CB_EDIT_PREFIX = "EDIT:"
+
+
+def analysis_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Исправить", callback_data=f"{MENU_CB_EDIT_PREFIX}{message_id}")]
+    ])
 
 def menu_keyboard():
     return InlineKeyboardMarkup([
@@ -751,6 +800,25 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data or ""
     log.info("callback received data=%s chat_id=%s", data, query.message.chat_id if query.message else None)
+
+    if data.startswith(MENU_CB_EDIT_PREFIX):
+        try:
+            bot_msg_id = int(data.split(":", 1)[1])
+        except Exception:
+            bot_msg_id = None
+        if bot_msg_id:
+            context.user_data["force_edit_message_id"] = bot_msg_id
+            try:
+                await query.answer("Режим редактирования включен")
+            except Exception:
+                pass
+            if query.message:
+                await query.message.reply_text(
+                    "✏️ Напишите, что исправить в разборе. "
+                    "Можно ответить реплаем на сообщение с разбором или отдельным сообщением."
+                )
+        return
+
     try:
         await query.answer("Обновляю…", show_alert=False)
     except Exception:
