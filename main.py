@@ -392,6 +392,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
     # Fresh text identification
+    processing_msg = await update.message.reply_text("📝 Описание получено, анализирую…")
     try:
         block = await llm_render_from_text(text)
     except Exception as e:
@@ -403,7 +404,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Флаги диеты:\n• vegetarian: нет  ·  vegan: нет\n• glutenfree: нет  ·  lactosefree: нет\n"
             "Допущения:\n• Оценка по описанию.\n• Ингредиенты и масса — приблизительно."
         )
-    sent = await update.message.reply_text(block)
+    try:
+        await processing_msg.edit_text(block)
+        sent = processing_msg
+    except Exception:
+        sent = await update.message.reply_text(block)
 
     # Admin ingestion
     ingest_info = _send_ingest_from_block(
