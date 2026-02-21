@@ -14,7 +14,7 @@
 #   ADMIN_API_KEY=supersecret
 
 import os, json, base64, sqlite3, logging
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, date, timedelta, time
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -43,6 +43,16 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
 MODEL_VISION = os.getenv("OPENAI_VISION_MODEL", "gpt-5")
 MODEL_TEXT   = os.getenv("OPENAI_TEXT_MODEL",   "gpt-5")
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DAILY_REPORT_ENABLED = _env_flag("DAILY_REPORT_ENABLED", default=True)
 
 if not TELEGRAM_TOKEN or not OPENAI_KEY:
     raise SystemExit("Set TELEGRAM_BOT_TOKEN and OPENROUTER_API_KEY (or OPENAI_API_KEY) in .env")
@@ -142,6 +152,18 @@ def get_last_interaction_by_chat(chat_id: int):
             """SELECT id, chat_id, original_message_id, bot_message_id, mode, original_hint, bot_output
                      FROM interactions WHERE chat_id=? ORDER BY id DESC LIMIT 1""",
             (chat_id,),
+        )
+        row = c.fetchone()
+    return row
+
+
+def get_interaction_by_id(interaction_id: int):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """SELECT id, chat_id, original_message_id, bot_message_id, mode, original_hint, bot_output
+                     FROM interactions WHERE id=?""",
+            (interaction_id,),
         )
         row = c.fetchone()
     return row
@@ -247,9 +269,12 @@ def _send_ingest_from_block(
     """Parse bot block and send to Admin API (upsert by message_id)."""
     try:
         parsed = parse_formatted_block(block_text)
+        effective_user = update.effective_user
+        if not effective_user:
+            return None
         ingest_meal({
-            "telegram_user_id": update.message.from_user.id,
-            "telegram_username": update.message.from_user.username,
+            "telegram_user_id": effective_user.id,
+            "telegram_username": effective_user.username,
             "captured_at_iso": datetime.now(timezone.utc).isoformat(),
             "title": parsed["title"],
             "portion_g": parsed["portion_g"],
@@ -511,6 +536,10 @@ MENU_CB_DAILY = "MENU_DAILY"
 MENU_CB_WEEKLY = "MENU_WEEKLY"
 MENU_CB_DAILY_DETAILS = "MENU_DAILY_DETAILS"
 MENU_CB_EDIT_PREFIX = "EDIT:"
+MENU_CB_DAILY_EDIT_PREFIX = "DDEDIT:"
+MENU_CB_DAILY_REGEN_PREFIX = "DDREGEN:"
+MENU_CB_DAILY_DELETE_PREFIX = "DDDEL:"
+MENU_CB_DAILY_DELETE_CONFIRM_PREFIX = "DDDELC:"
 
 
 def analysis_keyboard(message_id: int) -> InlineKeyboardMarkup:
@@ -525,13 +554,39 @@ def menu_keyboard():
         [InlineKeyboardButton("🧾 За сегодня подробно", callback_data=MENU_CB_DAILY_DETAILS)],
     ])
 
+
+def menu_with_daily_actions_keyboard(entries: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("🔄 Обновить список", callback_data=MENU_CB_DAILY_DETAILS)]]
+    for e in entries:
+        idx = e["idx"]
+        interaction_id = e["interaction_id"]
+        rows.append(
+            [
+                InlineKeyboardButton(f"✏️ #{idx}", callback_data=f"{MENU_CB_DAILY_EDIT_PREFIX}{interaction_id}"),
+                InlineKeyboardButton(f"🔁 #{idx}", callback_data=f"{MENU_CB_DAILY_REGEN_PREFIX}{interaction_id}"),
+                InlineKeyboardButton(f"🗑️ #{idx}", callback_data=f"{MENU_CB_DAILY_DELETE_PREFIX}{interaction_id}"),
+            ]
+        )
+    rows.extend(menu_keyboard().inline_keyboard)
+    return InlineKeyboardMarkup(rows)
+
+
+def menu_daily_delete_confirm_keyboard(interaction_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Да, удалить", callback_data=f"{MENU_CB_DAILY_DELETE_CONFIRM_PREFIX}{interaction_id}"),
+            InlineKeyboardButton("↩️ Отмена", callback_data=MENU_CB_DAILY_DETAILS),
+        ]
+    ])
+
 INSTRUCTION_TEXT = (
     "📖 Инструкция\n"
     "1. Пришлите фото блюда — бот вернёт разбор с калориями и БЖУ.\n"
     "2. Можно описать блюдо текстом.\n"
     "3. Уточнения: сообщение со словами ‘добавь’, ‘убери’, ‘без’, ‘ещё/еще’, ‘поменяй’, ‘замени’, или ответ реплаем.\n"
     "4. /menu — показать меню.\n"
-    "5. Сводки: кнопки ‘За сегодня’, ‘За неделю’ и ‘За сегодня подробно’."
+    "5. Сводки: кнопки ‘За сегодня’, ‘За неделю’ и ‘За сегодня подробно’.\n"
+    "6. В ‘За сегодня подробно’ можно редактировать, перегенерировать и удалять конкретное блюдо по кнопкам."
 )
 
 ABOUT_TEXT = (
@@ -747,6 +802,110 @@ async def _build_daily_details_text(telegram_user_id: int, chat_id: int | None =
         pass
     return "🧾 За сегодня подробно\n" + "\n".join(lines)
 
+
+async def _build_daily_details_payload(telegram_user_id: int, chat_id: int | None = None) -> tuple[str, list[dict]]:
+    try:
+        start, end = _msk_day_bounds_utc()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, created_at, bot_output FROM interactions
+            WHERE chat_id=? AND created_at>=? AND created_at<?
+            ORDER BY created_at ASC
+            """,
+            ((chat_id or telegram_user_id), start.isoformat(), end.isoformat()),
+        )
+        rows = c.fetchall()
+        conn.close()
+    except Exception:
+        rows = []
+
+    if not rows:
+        return ("🧾 За сегодня подробно\nСегодня ещё нет блюд.", [])
+
+    def _num(v):
+        try:
+            return int(round(float(v or 0)))
+        except Exception:
+            return 0
+
+    lines = []
+    entries = []
+    idx = 0
+    for interaction_id, created_at_iso, text in rows:
+        try:
+            parsed = parse_formatted_block(text)
+        except Exception:
+            continue
+        idx += 1
+        title = parsed.get("title") or "Блюдо"
+        portion = _num(parsed.get("portion_g"))
+        kcal = _num(parsed.get("kcal"))
+        p = _num(parsed.get("protein_g"))
+        f = _num(parsed.get("fat_g"))
+        carb = _num(parsed.get("carbs_g"))
+        try:
+            dt_local = datetime.fromisoformat(created_at_iso).astimezone()
+            dt_s = dt_local.strftime("%H:%M")
+        except Exception:
+            dt_s = created_at_iso[11:16]
+        lines.append(f"{idx}. {dt_s} — {title} · ~{portion} г · {kcal} ккал · Б:{p} г Ж:{f} г У:{carb} г")
+        entries.append({"idx": idx, "interaction_id": int(interaction_id)})
+
+    if not lines:
+        return ("🧾 За сегодня подробно\nСегодня ещё нет блюд.", [])
+    return ("🧾 За сегодня подробно\n" + "\n".join(lines), entries)
+
+
+async def _llm_regenerate_from_existing(previous_block: str, mode: str, original_hint: str) -> str:
+    if mode == "text" and (original_hint or "").strip():
+        return await llm_render_from_text(original_hint.strip())
+
+    resp = client.chat.completions.create(
+        model=MODEL_TEXT,
+        messages=[
+            {"role": "system", "content": SYSTEM_SIMPLE + "\n\n" + FORMAT_INSTRUCTIONS_RU.replace("{SOURCE}", "описанию")},
+            {"role": "user", "content": "Перегенерируй разбор блюда с нуля в том же формате, без лишнего текста."},
+            {"role": "user", "content": "Предыдущий блок:\n" + previous_block},
+            {"role": "user", "content": f"Подсказка пользователя (если была): {(original_hint or '').strip()}"},
+        ],
+        temperature=1,
+    )
+    content = resp.choices[0].message.content.strip()
+    return await ensure_fat_fiber_sections(content)
+
+async def _delete_ingested_meal_by_message_id(telegram_user_id: int, message_id: int) -> bool:
+    client_id = await _fetch_client_id(telegram_user_id)
+    if not client_id:
+        return False
+    base = os.getenv('ADMIN_API_BASE', 'http://localhost:8000')
+    api_key = os.getenv("ADMIN_API_KEY", "")
+    headers = {"x-api-key": api_key} if api_key else {}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client_http:
+            r = await client_http.delete(
+                f"{base}/clients/{client_id}/meals/by_message/{message_id}",
+                headers=headers,
+            )
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _delete_interaction_by_id(interaction_id: int, chat_id: int) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute(
+                "DELETE FROM interactions WHERE id=? AND chat_id=?",
+                (interaction_id, chat_id),
+            )
+            conn.commit()
+            return c.rowcount > 0
+    except Exception:
+        return False
+
 def _sum_local_for_period(telegram_user_id: int, start_utc: datetime, end_utc: datetime):
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -794,12 +953,235 @@ def _weekly_local_summary_text(telegram_user_id: int) -> str | None:
         return None
     return "📆 Сводка за неделю (начало " + start.astimezone(MSK).date().isoformat() + ")\n" + _fmt_macros(kcal, p, f, carb)
 
+
+def _known_chat_ids() -> list[int]:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            c = conn.cursor()
+            c.execute("SELECT DISTINCT chat_id FROM interactions WHERE chat_id IS NOT NULL")
+            rows = c.fetchall()
+        return [int(r[0]) for r in rows if r and r[0] is not None]
+    except Exception:
+        return []
+
+
+def _clip_message(text: str, limit: int = 3900) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1] + "…"
+
+
+async def send_daily_report_job(context: ContextTypes.DEFAULT_TYPE):
+    chats = _known_chat_ids()
+    if not chats:
+        return
+    for chat_id in chats:
+        try:
+            summary_text = await _build_daily_text(chat_id)
+            details_text, _ = await _build_daily_details_payload(chat_id, chat_id=chat_id)
+            details_body = details_text.replace("🧾 За сегодня подробно\n", "", 1)
+            report_text = (
+                f"🌙 Итог дня ({datetime.now(MSK).date().isoformat()})\n\n"
+                f"{summary_text}\n\n"
+                f"🧾 Подробно:\n{details_body}"
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=_clip_message(report_text),
+                disable_notification=True,
+            )
+        except Exception as e:
+            log.warning("daily report send failed chat_id=%s err=%s", chat_id, e)
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query:
         return
     data = query.data or ""
     log.info("callback received data=%s chat_id=%s", data, query.message.chat_id if query.message else None)
+
+    if data.startswith(MENU_CB_DAILY_EDIT_PREFIX):
+        try:
+            interaction_id = int(data.split(":", 1)[1])
+        except Exception:
+            interaction_id = None
+        if interaction_id:
+            row = get_interaction_by_id(interaction_id)
+            if row and row[1] == (query.message.chat_id if query.message else None):
+                bot_msg_id = row[3]
+                context.user_data["force_edit_message_id"] = bot_msg_id
+                try:
+                    await query.answer("Режим редактирования включен")
+                except Exception:
+                    pass
+                if query.message:
+                    await query.message.reply_text(
+                        "✏️ Напишите, что исправить в выбранном блюде. "
+                        "Например: «это не паста, а гречка с курицей, порция 220 г»."
+                    )
+            else:
+                try:
+                    await query.answer("Блюдо не найдено", show_alert=False)
+                except Exception:
+                    pass
+        return
+
+    if data.startswith(MENU_CB_DAILY_REGEN_PREFIX):
+        try:
+            interaction_id = int(data.split(":", 1)[1])
+        except Exception:
+            interaction_id = None
+        if not interaction_id:
+            try:
+                await query.answer("Некорректный запрос", show_alert=False)
+            except Exception:
+                pass
+            return
+        row = get_interaction_by_id(interaction_id)
+        if not row:
+            try:
+                await query.answer("Блюдо не найдено", show_alert=False)
+            except Exception:
+                pass
+            return
+        _, row_chat_id, _, bot_msg_id, mode, hint, prev_block = row
+        if row_chat_id != (query.message.chat_id if query.message else None):
+            try:
+                await query.answer("Нет доступа к этому блюду", show_alert=False)
+            except Exception:
+                pass
+            return
+        try:
+            await query.answer("Перегенерирую…", show_alert=False)
+        except Exception:
+            pass
+        try:
+            new_block = await _llm_regenerate_from_existing(prev_block, mode or "text", hint or "")
+        except Exception as e:
+            log.exception("LLM regenerate failed", exc_info=e)
+            if query.message:
+                await query.message.reply_text("⚠️ Не удалось перегенерировать блюдо. Попробуйте еще раз.")
+            return
+        try:
+            await context.bot.edit_message_text(
+                chat_id=row_chat_id,
+                message_id=bot_msg_id,
+                text=new_block,
+                reply_markup=analysis_keyboard(bot_msg_id),
+            )
+        except Exception:
+            if query.message:
+                await query.message.reply_text(new_block, reply_markup=analysis_keyboard(bot_msg_id))
+        update_interaction_bot_output(bot_msg_id, new_block)
+        ingest_info = _send_ingest_from_block(
+            block_text=new_block,
+            update=update,
+            message_id=bot_msg_id,
+            source_type=mode or "text",
+            image_path=None,
+        )
+        if ingest_info and ingest_info.get("missing_macros") and query.message:
+            await query.message.reply_text("⚠️ Не удалось определить БЖУ для этого блюда. Учтены только калории.")
+        if query.message:
+            details_text, entries = await _build_daily_details_payload(
+                query.from_user.id,
+                chat_id=query.message.chat_id,
+            )
+            await query.message.reply_text(details_text, reply_markup=menu_with_daily_actions_keyboard(entries))
+        return
+
+    if data.startswith(MENU_CB_DAILY_DELETE_PREFIX):
+        try:
+            interaction_id = int(data.split(":", 1)[1])
+        except Exception:
+            interaction_id = None
+        if not interaction_id:
+            try:
+                await query.answer("Некорректный запрос", show_alert=False)
+            except Exception:
+                pass
+            return
+        row = get_interaction_by_id(interaction_id)
+        if not row:
+            try:
+                await query.answer("Блюдо не найдено", show_alert=False)
+            except Exception:
+                pass
+            return
+        if row[1] != (query.message.chat_id if query.message else None):
+            try:
+                await query.answer("Нет доступа к этому блюду", show_alert=False)
+            except Exception:
+                pass
+            return
+        title = "Блюдо"
+        try:
+            parsed = parse_formatted_block(row[6] or "")
+            title = parsed.get("title") or title
+        except Exception:
+            pass
+        try:
+            await query.answer("Подтвердите удаление", show_alert=False)
+        except Exception:
+            pass
+        try:
+            await query.edit_message_text(
+                f"🗑️ Удалить блюдо «{title}»?\nЭто действие нельзя отменить.",
+                reply_markup=menu_daily_delete_confirm_keyboard(interaction_id),
+            )
+        except Exception:
+            if query.message:
+                await query.message.reply_text(
+                    f"🗑️ Удалить блюдо «{title}»?\nЭто действие нельзя отменить.",
+                    reply_markup=menu_daily_delete_confirm_keyboard(interaction_id),
+                )
+        return
+
+    if data.startswith(MENU_CB_DAILY_DELETE_CONFIRM_PREFIX):
+        try:
+            interaction_id = int(data.split(":", 1)[1])
+        except Exception:
+            interaction_id = None
+        if not interaction_id:
+            try:
+                await query.answer("Некорректный запрос", show_alert=False)
+            except Exception:
+                pass
+            return
+        row = get_interaction_by_id(interaction_id)
+        if not row:
+            try:
+                await query.answer("Блюдо уже удалено", show_alert=False)
+            except Exception:
+                pass
+            return
+        row_chat_id = row[1]
+        bot_msg_id = row[3]
+        if row_chat_id != (query.message.chat_id if query.message else None):
+            try:
+                await query.answer("Нет доступа к этому блюду", show_alert=False)
+            except Exception:
+                pass
+            return
+        deleted_local = _delete_interaction_by_id(interaction_id, row_chat_id)
+        deleted_remote = await _delete_ingested_meal_by_message_id(query.from_user.id, bot_msg_id)
+        try:
+            if deleted_local or deleted_remote:
+                await query.answer("Блюдо удалено", show_alert=False)
+            else:
+                await query.answer("Не удалось удалить блюдо", show_alert=False)
+        except Exception:
+            pass
+        details_text, entries = await _build_daily_details_payload(
+            query.from_user.id,
+            chat_id=(query.message.chat_id if query.message else None),
+        )
+        if query.message:
+            await query.edit_message_text(
+                details_text,
+                reply_markup=menu_with_daily_actions_keyboard(entries),
+            )
+        return
 
     if data.startswith(MENU_CB_EDIT_PREFIX):
         try:
@@ -825,6 +1207,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     try:
         post_to_chat = False
+        details_markup = menu_keyboard()
         user = query.from_user
         user_label = user.full_name or str(user.id)
         if user.username:
@@ -840,10 +1223,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "👤 " + user_label + "\n" + await _build_weekly_text(query.from_user.id)
             post_to_chat = True
         elif data == MENU_CB_DAILY_DETAILS:
-            text = await _build_daily_details_text(
+            text, details_entries = await _build_daily_details_payload(
                 query.from_user.id,
                 chat_id=(query.message.chat_id if query.message else None),
             )
+            details_markup = menu_with_daily_actions_keyboard(details_entries)
         else:
             text = "Неизвестный пункт меню."
     except Exception as e:
@@ -852,6 +1236,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if post_to_chat and query.message:
             await query.message.reply_text(text, reply_markup=menu_keyboard())
+        elif data == MENU_CB_DAILY_DETAILS:
+            await query.edit_message_text(text, reply_markup=details_markup)
         else:
             await query.edit_message_text(text, reply_markup=menu_keyboard())
     except Exception as e:
@@ -883,6 +1269,17 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
+    if app.job_queue and DAILY_REPORT_ENABLED:
+        app.job_queue.run_daily(
+            send_daily_report_job,
+            time=time(hour=23, minute=0, tzinfo=MSK),
+            name="daily_report_23_msk",
+        )
+        log.info("Scheduled daily report at 23:00 MSK")
+    elif app.job_queue:
+        log.info("Daily report schedule disabled by DAILY_REPORT_ENABLED")
+    else:
+        log.warning("JobQueue is unavailable; daily report schedule is disabled")
     log.info("Bot started.")
     from telegram import Update as TgUpdate
     app.run_polling(allowed_updates=TgUpdate.ALL_TYPES, close_loop=False, drop_pending_updates=False)

@@ -166,6 +166,24 @@ def list_meals(client_id: int, db: Session = Depends(get_db)):
     } for r in rows]
 
 
+@app.delete("/clients/{client_id}/meals/by_message/{message_id}")
+def delete_meal_by_message_id(
+    client_id: int,
+    message_id: int,
+    db: Session = Depends(get_db),
+    _=Depends(require_api_key),
+):
+    meal = db.query(Meal).filter(
+        Meal.client_id == client_id,
+        Meal.message_id == message_id,
+    ).first()
+    if not meal:
+        return {"ok": True, "deleted": False}
+    db.delete(meal)
+    db.commit()
+    return {"ok": True, "deleted": True}
+
+
 # ----- Targets / Questionnaire / Progress -----
 class Targets(BaseModel):
     kcal_target: int
