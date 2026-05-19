@@ -13,7 +13,7 @@
 #   ADMIN_API_BASE=http://localhost:8000
 #   ADMIN_API_KEY=supersecret
 
-import os, json, base64, sqlite3, logging
+import os, json, base64, sqlite3, logging, asyncio
 from datetime import datetime, timezone, date, timedelta, time
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -59,10 +59,16 @@ if not TELEGRAM_TOKEN or not OPENAI_KEY:
 
 # ------------- LOGGING -------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+for noisy_logger in ("httpx", "httpcore", "openai"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 log = logging.getLogger("foodbot")
 
 # ------------- OPENAI -------------
 client = get_llm_client()
+
+
+async def _run_llm_call(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def log_llm_startup_config() -> None:
@@ -222,7 +228,8 @@ async def llm_render_from_image(image_data_url: str, hint_text: str = "") -> str
     user_parts.append({"type": "image_url", "image_url": {"url": image_data_url}})
     if hint_text:
         user_parts.append({"type": "text", "text": f"Подпись/подсказка пользователя: {hint_text}"})
-    resp = client.chat.completions.create(
+    resp = await _run_llm_call(
+        client.chat.completions.create,
         model=MODEL_VISION,
         messages=[{"role":"user","content": user_parts}],
         temperature=1
@@ -233,22 +240,28 @@ async def llm_render_from_image(image_data_url: str, hint_text: str = "") -> str
 
 async def llm_render_from_text(text: str) -> str:
     prompt = SYSTEM_SIMPLE + "\n\n" + FORMAT_INSTRUCTIONS_RU.replace("{SOURCE}", "описанию") + "\nОписание: " + text
-    resp = client.chat_completions.create(  # fallback for SDK variations
-        model=MODEL_TEXT,
-        messages=[{"role":"user","content": prompt}],
-        temperature=1
-    ) if hasattr(client, "chat_completions") else client.chat.completions.create(
-        model=MODEL_TEXT,
-        messages=[{"role":"user","content": prompt}],
-        temperature=1
-    )
+    if hasattr(client, "chat_completions"):
+        resp = await _run_llm_call(
+            client.chat_completions.create,
+            model=MODEL_TEXT,
+            messages=[{"role":"user","content": prompt}],
+            temperature=1,
+        )
+    else:
+        resp = await _run_llm_call(
+            client.chat.completions.create,
+            model=MODEL_TEXT,
+            messages=[{"role":"user","content": prompt}],
+            temperature=1,
+        )
     # normalize SDK difference
     content = (resp.choices[0].message.content if hasattr(resp.choices[0], "message") else resp.choices[0].content).strip()
     content = await ensure_fat_fiber_sections(content)
     return content
 
 async def llm_revise(previous_block: str, correction_text: str) -> str:
-    resp = client.chat.completions.create(
+    resp = await _run_llm_call(
+        client.chat.completions.create,
         model=MODEL_TEXT,
         messages=[
             {"role":"system","content": REVISE_RULES},
@@ -314,7 +327,8 @@ async def ensure_fat_fiber_sections(block: str) -> str:
             "Строго верни только обновлённый блок без комментариев."
         )
         user_req = f"Отсутствуют: {missing_list}. Добавь соответствующие строки ровно в те места формата после БЖУ."
-        resp = client.chat.completions.create(
+        resp = await _run_llm_call(
+            client.chat.completions.create,
             model=MODEL_TEXT,
             messages=[
                 {"role": "system", "content": revise_system},
@@ -862,7 +876,8 @@ async def _llm_regenerate_from_existing(previous_block: str, mode: str, original
     if mode == "text" and (original_hint or "").strip():
         return await llm_render_from_text(original_hint.strip())
 
-    resp = client.chat.completions.create(
+    resp = await _run_llm_call(
+        client.chat.completions.create,
         model=MODEL_TEXT,
         messages=[
             {"role": "system", "content": SYSTEM_SIMPLE + "\n\n" + FORMAT_INSTRUCTIONS_RU.replace("{SOURCE}", "описанию")},
@@ -1255,7 +1270,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def main():
     init_db()
     log_llm_startup_config()
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).concurrent_updates(4).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("finalize", finalize_command))
     app.add_handler(CommandHandler("help", help_command))

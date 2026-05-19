@@ -27,7 +27,11 @@ def get_llm_client() -> OpenAI:
     if app_name:
         default_headers["X-Title"] = app_name
 
-    kwargs = {"api_key": api_key}
+    kwargs = {
+        "api_key": api_key,
+        "timeout": float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45")),
+        "max_retries": int(os.getenv("OPENAI_MAX_RETRIES", "2")),
+    }
     if base_url:
         kwargs["base_url"] = base_url
     if default_headers:
